@@ -1,0 +1,21 @@
+{
+  "llm": {
+    "provider": "openai_compat",
+    "base_url": "http://127.0.0.1:8080/v1",
+    "model": "ornith9b",
+    "api_key": "not-needed",
+    "request_timeout_s": 1800,
+    "context_window_tokens": 32768
+  },
+  "budget": {
+    "max_subtask_attempts": 3,
+    "max_replan_cycles": 2,
+    "max_steps_per_attempt": 40,
+    "max_output_tokens": 8000,
+    "max_wall_clock_seconds": 21600,
+    "default_command_timeout": 300
+  },
+  "approval": {
+    "mode": "smart"
+  }
+}

@@ -1,0 +1,5 @@
+# Core agent (local llama-server / any OpenAI-compatible endpoint) uses only
+# the Python standard library -- nothing to install for that path.
+#
+# Only needed if you set "provider": "anthropic" in your config file:
+#   pip install anthropic
