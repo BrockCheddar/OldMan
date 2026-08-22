@@ -1,0 +1,1 @@
+the spirit of this project is a model agnostic autocoder for a nontechnical to spell out in plain English a complex task to the harness and receive observable deliverables. the license is non. steal what you want or need. the all or nothing days are back.
