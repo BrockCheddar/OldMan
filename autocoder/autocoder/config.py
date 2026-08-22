@@ -24,18 +24,25 @@ from pathlib import Path
 DEFAULT_CONFIG_FILENAME = "autocoder.config.json"
 
 # Commands that never need human approval to run (read-only / local-only,
-# safe-by-default). Matched against the start of the command, case-insensitive.
+# safe-by-default). Matched against the start of the command, case-insensitive,
+# AFTER the command has been split on shell operators (&&, ||, ;, |) and
+# EVERY segment is required to match one of these -- see classify_command.
+#
+# IMPORTANT: bare interpreters ("python ", "node ", etc.) must never appear
+# here. They're general-purpose code execution, not read-only commands --
+# "python -c \"import shutil; shutil.rmtree(...)\"" would match a bare
+# "python " prefix just as well as a real test run. List the exact safe
+# invocation forms instead (module flags, not the interpreter itself).
 SAFE_COMMAND_PREFIXES = {
     "git status", "git diff", "git log", "git show", "git branch",
     "ls", "dir", "cat", "type", "find", "tree",
     "mkdir",
-    "python ", "python3 ", "python.exe ",
-    "pytest", "python -m pytest", "python3 -m pytest",
+    "pytest", "python -m pytest", "python3 -m pytest", "python.exe -m pytest",
     "npm test", "npm run test", "yarn test",
     "go test", "cargo test",
     "mypy", "pyright", "eslint", "tsc",
-    "python -m py_compile", "python3 -m py_compile",
-    "node --check", "node ",
+    "python -m py_compile", "python3 -m py_compile", "python.exe -m py_compile",
+    "node --check",
 }
 
 # Substrings that ALWAYS force an approval prompt, even over a safe prefix match.
@@ -109,6 +116,10 @@ class Config:
     @property
     def lessons_file(self) -> Path:
         return self.session_dir / "lessons.json"
+
+    @property
+    def decisions_file(self) -> Path:
+        return self.session_dir / "decisions.json"
 
 
 def load_llm_backend(d: dict) -> LLMBackendConfig:
