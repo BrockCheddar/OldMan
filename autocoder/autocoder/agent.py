@@ -30,7 +30,7 @@ from .approval import ask_human_question
 from .budget import BudgetTracker, BudgetExceeded
 from .config import Config
 from .lessons import LessonsStore
-from .llm import build_llm_client, LLMError, Turn, ToolResult, trim_history_to_fit, history_char_len
+from .llm import build_llm_client, LLMError, Turn, ToolResult, trim_history_to_fit
 from .osinfo import shell_description
 from .planner import RunState, CompletedStep, StepContext
 from .repetition import RepetitionGuard
@@ -151,7 +151,10 @@ UPDATE_SCRATCHPAD_TOOL = {
 # that a regression could have just happened. Any real file change must go
 # through propose_step -> the inner loop, where mark_step_done actually
 # re-verifies the result.
-_OUTER_SAFE_TOOL_NAMES = {"read_file", "list_dir", "search_code", "run_command", "git_diff", "git_log", "ask_human"}
+_OUTER_SAFE_TOOL_NAMES = {
+    "read_file", "list_dir", "search_code", "run_command", "git_diff", "git_log",
+    "ask_human", "record_decision",
+}
 OUTER_WORKSPACE_TOOLS = [t for t in TOOL_SCHEMAS if t["name"] in _OUTER_SAFE_TOOL_NAMES]
 OUTER_TOOLS = OUTER_WORKSPACE_TOOLS + [PROPOSE_STEP_TOOL, DECLARE_DONE_TOOL, UPDATE_SCRATCHPAD_TOOL]
 
@@ -204,6 +207,20 @@ class Agent:
 
     # ── LLM call wrapper: backend failures don't crash the run ─────────────
 
+    MAX_SCRATCHPAD_CHARS = 4000
+
+    def _set_scratchpad(self, state: "RunState", text: str) -> None:
+        """Every scratchpad write goes through here. The scratchpad is
+        embedded directly into the outer loop's context_msg as plain text,
+        not a tool_results entry -- trim_history_to_fit only ever shrinks
+        tool_results, so an unbounded scratchpad would sail right past
+        that safety net. This is the actual cap for this specific field,
+        keeping the most recent content (usually what's still relevant)
+        rather than the oldest."""
+        if len(text) > self.MAX_SCRATCHPAD_CHARS:
+            text = "...[older scratchpad content trimmed]...\n" + text[-self.MAX_SCRATCHPAD_CHARS:]
+        state.scratchpad = text
+
     def _call_llm(self, state: RunState, system: str, history: list[Turn], tools: list[dict]):
         """
         Wraps self.llm.complete(). A backend failure/timeout (LLMError) no
@@ -213,6 +230,27 @@ class Agent:
         """
         while True:
             try:
+                # Last line of defense: shrink oversized tool_results in
+                # place if the REAL prompt token count (via the backend's
+                # own tokenizer, not a character guess) would exceed the
+                # real context window. compact_history_with_state_report
+                # (see call sites above/below) handles the common case at
+                # coarser points in the loop, but it only runs AFTER a call
+                # returns and results are appended -- a turn appended just
+                # before THIS call (e.g. a growing scratchpad/completed-
+                # steps summary) could still overflow with nothing catching
+                # it. Inside the try so a tokenize-endpoint failure gets the
+                # same retry/abort handling as any other backend failure.
+                _, trimmed = trim_history_to_fit(
+                    history, system, self.llm.count_tokens,
+                    self.config.llm.context_window_tokens,
+                    reserve_output_tokens=self.config.budget.max_output_tokens,
+                    tools=tools,
+                )
+                if trimmed:
+                    print("[context] trimmed oversized tool output to fit context window")
+                    self.session.log_event("context_trim", {})
+
                 response = self.llm.complete(
                     system=system, history=history, tools=tools,
                     max_tokens=self.config.budget.max_output_tokens,
@@ -272,6 +310,9 @@ class Agent:
         repetition_guard = RepetitionGuard()
 
         while state.status == "running":
+            # Reset for record_decision's originating_step -- _inner_loop
+            # overwrites this to the active step's title for its duration.
+            self.toolbox.current_context = "outer loop (exploration)"
             warning = self.budget.wall_clock_warning()
             if warning:
                 print(f"[budget] {warning}")
@@ -314,6 +355,7 @@ class Agent:
             tool_results: list[ToolResult] = []
             acted = False
             force_escalate_reason: str | None = None
+            history_reset = False
 
             for call in response.tool_calls:
 
@@ -342,7 +384,7 @@ class Agent:
                         self.session.save_state(state)
                         return
                     # not accepted -- tell the model exactly why, not just "keep going"
-                    state.scratchpad += f"\n[Feedback on declare_done attempt]: {feedback}"
+                    self._set_scratchpad(state, state.scratchpad + f"\n[Feedback on declare_done attempt]: {feedback}")
                     self.session.save_state(state)
                     tool_results.append(ToolResult(
                         tool_call_id=call.id, is_error=True,
@@ -410,6 +452,7 @@ class Agent:
                         # human gave guidance (not abort) -- start fresh with
                         # it in the scratchpad rather than ending the run
                         history = []
+                        history_reset = True
                         acted = True
                         break
                     state.completed_steps.append(completed)
@@ -420,12 +463,13 @@ class Agent:
                     # reset outer history after each completed step so context
                     # stays bounded and old tool output doesn't pile up
                     history = []
+                    history_reset = True
                     self.budget.new_outer_span()  # real progress -- grant a fresh outer budget
                     acted = True
                     break  # one propose_step per outer turn
 
                 if call.name == "update_scratchpad":
-                    state.scratchpad = call.input.get("scratchpad", "")
+                    self._set_scratchpad(state, call.input.get("scratchpad", ""))
                     self.session.save_state(state)
                     tool_results.append(ToolResult(tool_call_id=call.id, content="Scratchpad updated."))
                     acted = True
@@ -464,13 +508,14 @@ class Agent:
                             )
                     tool_results.append(ToolResult(tool_call_id=call.id, content=output))
                 except ToolError as e:
+                    print(f"    -> ERROR: {e}")
                     tool_results.append(ToolResult(tool_call_id=call.id, content=f"ERROR: {e}", is_error=True))
                 self.session.log_event("tool_call", {"name": call.name})
                 acted = True
                 if force_escalate_reason:
                     break
 
-            if tool_results and not any(c.name == "propose_step" for c in response.tool_calls):
+            if tool_results and not history_reset:
                 history.append(Turn(role="tool_results", tool_results=tool_results))
                 if self._prompt_over_budget(system, history, OUTER_TOOLS):
                     report = self._build_outer_state_report(state)
@@ -486,10 +531,8 @@ class Agent:
                 continue
 
     def _prompt_over_budget(self, system: str, history: list[Turn], tools: list[dict]) -> bool:
-        budget_tokens = self.config.llm.context_window_tokens - self.config.budget.max_output_tokens
-        budget_tokens = max(budget_tokens, 1)
-        budget_chars = budget_tokens * 4
-        return history_char_len(system, history, tools) > budget_chars
+        budget_tokens = max(self.config.llm.context_window_tokens - self.config.budget.max_output_tokens, 1)
+        return self.llm.count_tokens(system, history, tools) > budget_tokens
 
     def _build_state_report(self, step_context: StepContext, attempt: int, max_attempts: int,
                              last_check_summary: str = "") -> str:
@@ -559,9 +602,20 @@ class Agent:
         last_attempt_note = ""      # carried into the next attempt's fresh history
         last_check_summary = ""     # most recent real acceptance-check result, for state reports
         repetition_guard = RepetitionGuard()
+        # record_decision's originating_step label for the duration of this
+        # step; _outer_loop resets it back to the default on its next turn.
+        self.toolbox.current_context = f"step: {step_context.title}"
 
         while attempts < self.config.budget.max_subtask_attempts:
             self.budget.new_attempt()
+            # Clean slate: discard whatever the previous attempt (if any)
+            # left behind. Without this, a failed attempt's half-finished
+            # or broken edits stay in the working tree and get inherited by
+            # the next attempt -- and if THAT attempt passes, git_commit_all's
+            # `git add -A` sweeps the leftover junk in as part of a
+            # "passing" commit. A no-op on the first attempt (nothing to
+            # revert yet).
+            self.workspace.git_revert_to_last_commit()
             system = self._inner_system_prompt(state, step_context)
             # Fresh coder context every attempt. The planner conversation is
             # deliberately NOT carried across this boundary. Only the compact
@@ -582,9 +636,9 @@ class Agent:
                     attempts += 1
                     last_attempt_note = (
                         "A previous attempt on this step ran out of its step budget "
-                        "without ever calling mark_step_done. Re-check the ACTUAL current "
-                        "file state first (list_dir/read_file) rather than assuming nothing "
-                        "was done, then work directly and efficiently toward mark_step_done."
+                        "without ever calling mark_step_done. Its edits have been reverted -- "
+                        "the workspace is back to the last passing commit, so start clean. "
+                        "Work directly and efficiently toward mark_step_done this time."
                     )
                     break  # try another attempt, with fresh history
 
@@ -628,6 +682,7 @@ class Agent:
                                 )
                         tool_results.append(ToolResult(tool_call_id=call.id, content=output))
                     except ToolError as e:
+                        print(f"      -> ERROR: {e}")
                         tool_results.append(ToolResult(tool_call_id=call.id, content=f"ERROR: {e}", is_error=True))
                     self.session.log_event("tool_call", {"name": call.name})
 
@@ -636,10 +691,10 @@ class Agent:
                     repetition_guard.checkpoint()
                     summary = mark_call.input.get("summary", "")
                     if mark_call.input.get("scratchpad"):
-                        state.scratchpad = mark_call.input["scratchpad"]
+                        self._set_scratchpad(state, mark_call.input["scratchpad"])
 
                     print(f"    [check] {step_context.acceptance_command}")
-                    result = self.workspace.run_command(
+                    result = self.toolbox.run_gated_command(
                         step_context.acceptance_command,
                         timeout=self.config.budget.default_command_timeout,
                     )
@@ -679,11 +734,18 @@ class Agent:
                     last_check_summary = failure_detail[-800:]
                     last_attempt_note = (
                         f"A previous attempt's mark_step_done failed this exact acceptance check:\n"
-                        f"{failure_detail}\nFix the actual underlying problem this time -- "
-                        "don't just retry the same thing."
+                        f"{failure_detail}\nThat attempt's edits have been reverted -- you're starting "
+                        "from the last passing commit again, not from what it left behind. "
+                        "Fix the actual underlying problem this time, don't just retry the same thing."
                     )
                     check_failures += 1
                     print(f"    [check] FAILED (attempt {attempts}/{self.config.budget.max_subtask_attempts})")
+                    # discard this attempt's edits now, not just at the top
+                    # of the next outer-loop pass -- a failed mark_step_done
+                    # keeps the SAME inner history/context going (see
+                    # last_attempt_note above), it doesn't restart the loop,
+                    # so this is the actual retry point that needs the revert.
+                    self.workspace.git_revert_to_last_commit()
                     if attempts >= self.config.budget.max_subtask_attempts:
                         return None, _inner_loop_failure_reason(step_context.title, check_failures, derailed_attempts)
 
@@ -711,15 +773,46 @@ class Agent:
 
     # ── done verification ──────────────────────────────────────────────────
 
+    def _check_no_regressions(self, state: RunState) -> str | None:
+        """Re-run every previously-completed step's acceptance command.
+        Without this, step 7 can silently break what step 3 verified --
+        each step's check only runs once, at the moment it's marked done,
+        and git_commit_all's `git add -A` sweeps up whatever the working
+        tree looks like at that point regardless. Returns None if every
+        prior step still passes, or feedback text (naming which step
+        regressed) to send back to the model if not."""
+        for step in state.completed_steps:
+            result = self.toolbox.run_gated_command(
+                step.acceptance_command,
+                timeout=self.config.budget.default_command_timeout,
+            )
+            if result.exit_code != 0 or result.timed_out:
+                print(f"[regression-check] step {step.index} ('{step.title}') now FAILS")
+                return (
+                    f"Regression detected: step {step.index} ('{step.title}') used to pass "
+                    f"its acceptance command but does not anymore.\n"
+                    f"$ {step.acceptance_command}\n"
+                    f"exit {result.exit_code}{' (TIMED OUT)' if result.timed_out else ''}\n"
+                    f"stdout:\n{result.stdout[-2000:]}\nstderr:\n{result.stderr[-2000:]}\n"
+                    "Fix this regression before declaring the goal done."
+                )
+        if state.completed_steps:
+            print(f"[regression-check] {len(state.completed_steps)}/{len(state.completed_steps)} prior steps still pass")
+        return None
+
     def _verify_done(self, state: RunState, summary: str,
                       final_acceptance_command: str | None) -> tuple[bool, str]:
         """Returns (accepted, feedback). feedback is empty when accepted;
         otherwise it's real command output (acceptance-command path) or
         whatever the human typed (interactive path) -- either way it goes
         back to the model, not just a generic 'try again'."""
+        regression_feedback = self._check_no_regressions(state)
+        if regression_feedback:
+            return False, regression_feedback
+
         if final_acceptance_command:
             print(f"[done-check] {final_acceptance_command}")
-            result = self.workspace.run_command(
+            result = self.toolbox.run_gated_command(
                 final_acceptance_command,
                 timeout=self.config.budget.default_command_timeout,
             )
@@ -774,7 +867,7 @@ class Agent:
             state.status = "aborted"
             self.session.save_state(state)
             raise AgentAborted()
-        state.scratchpad += f"\n[Human guidance]: {guidance}"
+        self._set_scratchpad(state, state.scratchpad + f"\n[Human guidance]: {guidance}")
         self.session.save_state(state)
         # Recorded as a real lesson only if something afterward actually
         # succeeds (see the two _finalize_pending_lesson() call sites below).
@@ -802,11 +895,29 @@ LESSONS FROM PAST RUNS IN THIS WORKSPACE (verified -- each was an actual problem
 followed by a confirmed successful outcome, not a guess):
 {self.lessons.summary_text()}
 
-Your job: make incremental, verifiable progress toward the goal.
+ACTIVE DECISIONS FOR THIS PROJECT (durable choices already made -- do not
+contradict these; if you make a NEW architecture/technology/convention choice
+here, call record_decision right away for that one choice -- one decision
+per call, in the moment you decide it, not bundled with others or saved up
+for later):
+{self.toolbox.decisions.summary_text()}
+
+Your job: make incremental, verifiable progress toward the goal, in small
+steps -- not one step that quietly builds the whole thing.
 Each iteration: either explore the workspace with READ-ONLY tools to gather
 evidence (read_file, list_dir, search_code, run_command, git_diff, git_log),
 then call propose_step to declare ONE concrete next action with a real
 acceptance command -- or call declare_done when the goal is fully complete.
+
+WHAT COUNTS AS "ONE STEP": a single focused unit of work you could describe
+in one sentence and verify with one specific command -- e.g. "add the
+Contact dataclass and its field validators", not "build the contact book".
+If your plan for a step touches several unrelated pieces (the data model AND
+storage AND every CLI subcommand AND tests, say), that is not one step --
+propose the smallest useful piece of it now, and propose the rest as
+separate later steps once this one is verified. Most steps should touch
+1-3 files. Needing 20+ tool calls to finish a step is a sign it should have
+been split before you started, not evidence it was one step all along.
 
 Rules:
 - write_file and edit_file are NOT available here on purpose. Any actual
@@ -817,7 +928,11 @@ Rules:
 - propose_step ONE step at a time. Do not plan ahead; decide after seeing
   real evidence from the previous step.
 - Every acceptance_command must be a real shell command that exits 0 on
-  success (compile check, test run, file existence check, etc).
+  success (compile check, test run, file existence check, etc), and it
+  must actually verify what the step claims to do. If the only check you
+  can write is shallow (e.g. a file merely exists) while the work you're
+  planning is much bigger than that, the step itself is too big -- shrink
+  the step until a single specific command can meaningfully verify it.
 - Use the scratchpad (update_scratchpad or the scratchpad field of
   mark_step_done) to keep working notes across steps.
 - Only call declare_done when ALL work is complete and verifiable.
@@ -841,6 +956,13 @@ COMPLETED SO FAR:
 LESSONS FROM PAST RUNS IN THIS WORKSPACE (verified -- each was an actual problem
 followed by a confirmed successful outcome, not a guess):
 {self.lessons.summary_text()}
+
+ACTIVE DECISIONS FOR THIS PROJECT (durable choices already made -- do not
+contradict these; if you make a NEW architecture/technology/convention choice
+here, call record_decision right away for that one choice -- one decision
+per call, in the moment you decide it, not bundled with others or saved up
+for later):
+{self.toolbox.decisions.summary_text()}
 
 IMPORTANT CONTEXT BOUNDARY:
 The planner/exploration conversation is intentionally not included in this context.
