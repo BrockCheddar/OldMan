@@ -22,7 +22,7 @@ import json
 import urllib.request
 import urllib.error
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from .config import LLMBackendConfig
 
@@ -66,58 +66,59 @@ class LLMError(RuntimeError):
     pass
 
 
+# A flat "tokenize the concatenated text" call (see OpenAICompatBackend.
+# count_tokens) gets the REAL token count for actual message content, but
+# can't see the role/special-token framing the chat template inserts
+# BETWEEN messages (e.g. <|im_start|>user ... <|im_end|>). That's a small,
+# bounded, well-understood category of overhead -- not a guess at how
+# densely code tokenizes -- so it's a fixed per-message constant rather
+# than a blanket safety margin. If a context overflow still happens after
+# this, the fix is to raise this number, not to add another vague buffer.
+CHAT_TEMPLATE_OVERHEAD_TOKENS_PER_MESSAGE = 12
+
+
 class LLMClient:
     def complete(self, system: str, history: list[Turn], tools: list[dict], max_tokens: int) -> LLMResponse:
         raise NotImplementedError
 
-
-# ---------------------------------------------------------------------------
-# Rough, tokenizer-free context sizing (used only to decide when to trim old
-# tool output before hitting the backend -- not for billing/accounting).
-# ~4 chars/token is a reasonable average across code+English; err generous
-# (undercount tokens) so we trim earlier rather than overflow the server.
-# ---------------------------------------------------------------------------
-
-def estimate_tokens(text: str) -> int:
-    return max(1, len(text) // 4)
+    def count_tokens(self, system: str, history: list[Turn], tools: list[dict]) -> int:
+        """The REAL prompt token count for this exact request, from this
+        backend's own tokenizer -- not a character-based guess. Every
+        backend must implement this for real; there is no default/fallback
+        implementation here on purpose, so a backend that can't report a
+        real count fails loudly instead of silently under-counting."""
+        raise NotImplementedError
 
 
-def history_char_len(system: str, history: list[Turn], tools: list[dict] | None = None) -> int:
-    total = len(system)
-    if tools:
-        # Tool schema definitions (name + description + input_schema) are
-        # sent with EVERY request -- this must be counted, not just the
-        # conversation text.
-        total += len(json.dumps(tools))
-    for t in history:
-        if t.text:
-            total += len(t.text)
-        for tc in t.tool_calls:
-            total += len(tc.name) + len(json.dumps(tc.input))
-        for tr in t.tool_results:
-            total += len(tr.content)
-    return total
-
-
-def trim_history_to_fit(history: list[Turn], system: str, context_window_tokens: int,
-                         reserve_output_tokens: int, tools: list[dict] | None = None) -> tuple[list[Turn], bool]:
+def trim_history_to_fit(history: list[Turn], system: str,
+                         count_tokens_fn: "Callable[[str, list[Turn], list[dict] | None], int]",
+                         context_window_tokens: int, reserve_output_tokens: int,
+                         tools: list[dict] | None = None) -> tuple[list[Turn], bool]:
     """
-    If the (rough) estimated prompt size would exceed the model's real
-    context window, replace the CONTENTS of the oldest tool_results with a
-    short placeholder (keeping the turn structure and tool_call/result
-    pairing intact, which most backends require) until it fits, or until
-    nothing more can be trimmed.
+    If the REAL prompt token count -- from count_tokens_fn, which calls the
+    actual backend's own tokenizer (see LLMClient.count_tokens), not a
+    character-based guess -- would exceed the model's real context window,
+    replace the CONTENTS of the oldest tool_results with a short placeholder
+    (keeping the turn structure and tool_call/result pairing intact, which
+    most backends require) until it fits, or until nothing more can be
+    trimmed.
+
+    There is deliberately no character-based fallback here: guessing
+    chars-per-token is what caused a real overflow in production (a request
+    landed a few dozen tokens over a configured context window because the
+    estimate didn't match how the real tokenizer actually counted
+    code-heavy content). If count_tokens_fn can't produce a real count, it
+    should raise -- see LLMClient.count_tokens -- and that failure surfaces
+    through the normal LLMError retry/abort path instead of silently
+    under-trimming.
 
     Nothing about the actual code is lost -- every accepted change is a git
     commit regardless of what's still in the model's short-term context.
     Returns (possibly-modified history, whether anything was trimmed).
     """
-    budget_tokens = context_window_tokens - reserve_output_tokens
-    if budget_tokens <= 0:
-        budget_tokens = 1
-    budget_chars = budget_tokens * 4  # inverse of the ~4 chars/token estimate
+    budget_tokens = max(context_window_tokens - reserve_output_tokens, 1)
 
-    if history_char_len(system, history, tools) <= budget_chars:
+    if count_tokens_fn(system, history, tools) <= budget_tokens:
         return history, False
 
     trimmed = False
@@ -125,7 +126,7 @@ def trim_history_to_fit(history: list[Turn], system: str, context_window_tokens:
     # are almost always the bulkiest (command output, file dumps) and the
     # least likely to matter once several turns have passed.
     for turn in history:
-        if history_char_len(system, history, tools) <= budget_chars:
+        if count_tokens_fn(system, history, tools) <= budget_tokens:
             break
         for tr in turn.tool_results:
             if len(tr.content) > 400:
@@ -210,7 +211,57 @@ class OpenAICompatBackend(LLMClient):
         ]
 
     def _post(self, path: str, payload: dict) -> dict:
-        url = self.cfg.base_url.rstrip("/") + path
+        return self._post_url(self.cfg.base_url.rstrip("/") + path, payload)
+
+    def _server_root(self) -> str:
+        """base_url is the OpenAI-compat mount point (e.g. .../v1).
+        llama-server's native endpoints (/tokenize, /health, /props) live at
+        the server root, one level up from that."""
+        base = self.cfg.base_url.rstrip("/")
+        if base.endswith("/v1"):
+            base = base[: -len("/v1")]
+        return base
+
+    def count_tokens(self, system: str, history: list[Turn], tools: list[dict]) -> int:
+        """Real token count from llama-server's own tokenizer via its
+        native /tokenize endpoint -- not a character-based guess. Builds
+        the same messages/tools structure the real request would send,
+        concatenates their text content, and tokenizes that for real.
+
+        The one gap a flat concatenated-text tokenize call can't see is the
+        role/special-token framing the chat template inserts BETWEEN
+        messages (e.g. <|im_start|>user ... <|im_end|>) -- that's a small,
+        bounded, well-understood category of overhead, not a guess at
+        content density, so it's covered by a fixed per-message constant
+        rather than a blanket safety margin."""
+        messages = self._to_openai_messages(system, history)
+        oa_tools = self._to_openai_tools(tools)
+        parts: list[str] = []
+        for m in messages:
+            parts.append(str(m.get("role", "")))
+            if m.get("content"):
+                parts.append(str(m["content"]))
+            for tc in (m.get("tool_calls") or []):
+                parts.append(tc["function"]["name"])
+                parts.append(tc["function"]["arguments"])
+        if oa_tools:
+            parts.append(json.dumps(oa_tools))
+        text = "\n".join(parts)
+
+        url = self._server_root() + "/tokenize"
+        body = self._post_url(url, {"content": text})
+        tok = body.get("tokens")
+        if not isinstance(tok, list):
+            raise LLMError(
+                f"local model server's native /tokenize endpoint at {url} returned an "
+                f"unexpected response ({body!r}). This requires llama-server itself (or "
+                f"another backend exposing the same native /tokenize endpoint), not just "
+                f"any OpenAI-compat server -- some proxies/gateways only implement the "
+                f"/v1/chat/completions route."
+            )
+        return len(tok) + len(messages) * CHAT_TEMPLATE_OVERHEAD_TOKENS_PER_MESSAGE
+
+    def _post_url(self, url: str, payload: dict) -> dict:
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
             url, data=data, method="POST",
@@ -228,12 +279,12 @@ class OpenAICompatBackend(LLMClient):
         except urllib.error.HTTPError as e:
             detail = e.read().decode("utf-8", errors="replace")
             raise LLMError(
-                f"local model server at {self.cfg.base_url} returned HTTP {e.code}: {detail}\n"
+                f"local model server at {url} returned HTTP {e.code}: {detail}\n"
                 f"(check that llama-server is actually running and --port matches base_url)"
             ) from e
         except urllib.error.URLError as e:
             raise LLMError(
-                f"could not reach local model server at {self.cfg.base_url}: {e.reason}\n"
+                f"could not reach local model server at {url}: {e.reason}\n"
                 f"(is llama-server running? e.g. `llama-server -m <ornith9b.gguf> --port 8080`)"
             ) from e
         except OSError as e:
@@ -245,7 +296,7 @@ class OpenAICompatBackend(LLMClient):
             # in urllib/http.client instead of a clean, retryable LLMError.
             reason = getattr(e, "reason", e)
             raise LLMError(
-                f"local model server at {self.cfg.base_url} did not respond in time or the "
+                f"local model server at {url} did not respond in time or the "
                 f"connection failed ({type(e).__name__}: {reason}). If this happens on "
                 f"long-running tasks, consider raising request_timeout_s in your config; "
                 f"if it happens immediately, check that llama-server is actually running."
@@ -291,6 +342,19 @@ class AnthropicBackend(LLMClient):
             input_tokens=response.usage.input_tokens,
             output_tokens=response.usage.output_tokens,
         )
+
+    def count_tokens(self, system: str, history: list[Turn], tools: list[dict]) -> int:
+        """Anthropic exposes a dedicated, exact token-counting endpoint --
+        the same count the real API call would use, no estimation
+        involved at all."""
+        messages = self._to_anthropic_messages(history)
+        try:
+            result = self._client.messages.count_tokens(
+                model=self.cfg.model, system=system, messages=messages, tools=tools,
+            )
+        except Exception as e:
+            raise LLMError(f"Anthropic count_tokens call failed: {e}") from e
+        return result.input_tokens
 
     @staticmethod
     def _to_anthropic_messages(history: list[Turn]) -> list[dict]:
