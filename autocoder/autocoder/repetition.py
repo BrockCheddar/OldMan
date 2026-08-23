@@ -63,7 +63,8 @@ class RepetitionGuard:
                 f"{self._consecutive_count} times in a row without an acceptance check "
                 "in between. Stop and verify your actual current state first -- read "
                 "the file back, or run a real check -- before making further "
-                "changes to it blind."
+                "changes to it blind. If you're not sure your current approach even "
+                "works, consider discard_and_restart instead of guessing again."
             )
         return None
 

@@ -15,7 +15,8 @@ from typing import Any, Callable
 
 from .approval import ApprovalDecision, classify_command, confirm_with_human, ask_human_question
 from .config import Config
-from .workspace import Workspace, WorkspaceError
+from .decisions import DecisionsStore
+from .workspace import CommandResult, Workspace, WorkspaceError
 
 IGNORE_DIR_NAMES = {".git", "node_modules", "__pycache__", ".venv", "venv",
                     ".autocoder", "dist", "build", ".mypy_cache", ".pytest_cache"}
@@ -128,6 +129,39 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "input_schema": {"type": "object", "properties": {"n": {"type": "integer", "default": 10}}},
     },
     {
+        "name": "record_decision",
+        "description": (
+            "Record a durable project decision -- an architecture, technology, or "
+            "convention choice a LATER step needs to stay consistent with (e.g. "
+            "picking a library, a data format, a naming convention, or deliberately "
+            "deferring a feature). Once recorded, it appears automatically in every "
+            "future prompt in both loops -- you never need to restate it yourself. "
+            "To change an earlier decision, pass its id (shown in brackets in the "
+            "'ACTIVE DECISIONS' section of this prompt) as supersedes; it stops "
+            "appearing as active, replaced by this new one. Do not call this for "
+            "routine implementation detail -- only for choices a future step could "
+            "otherwise contradict."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "decision": {
+                    "type": "string",
+                    "description": "The decision itself, stated plainly, e.g. 'Use SQLAlchemy ORM, not raw sqlite3'.",
+                },
+                "supersedes": {
+                    "type": "string",
+                    "description": (
+                        "Optional. The [id] of an earlier active decision this one "
+                        "replaces. Leave unset if this is a new decision, not a "
+                        "change to an existing one."
+                    ),
+                },
+            },
+            "required": ["decision"],
+        },
+    },
+    {
         "name": "ask_human",
         "description": (
             "Ask the human a clarifying question when the goal or a subtask is "
@@ -161,6 +195,15 @@ class ToolBox:
         # human isn't counted as the agent "running" (see budget.py).
         self._on_pause = on_pause
         self._on_resume = on_resume
+        # record_decision is dispatched identically from the outer and inner
+        # loops (see agent.py) via this single shared store -- there is
+        # deliberately no per-loop handler to keep in sync.
+        self.decisions = DecisionsStore(config.decisions_file)
+        # Label attached to decisions.add() as `originating_step` -- context
+        # only, never validated. agent.py sets this to the active step's
+        # title before entering the inner loop and resets it back to the
+        # default at the top of each outer-loop turn.
+        self.current_context = "outer loop (exploration)"
 
     def _blocking_input(self, fn: Callable[[], Any]) -> Any:
         if self._on_pause:
@@ -200,7 +243,24 @@ class ToolBox:
                 f"{e} -- use a path relative to the workspace root, not an absolute path."
             )
 
+    def _resolve_for_write(self, path: str) -> Path:
+        """Like _resolve, but for the mutation tools (write_file,
+        edit_file) -- also refuses paths inside .git/ or .autocoder/."""
+        try:
+            return self.ws.resolve_for_write(path)
+        except WorkspaceError as e:
+            raise ToolError(str(e))
+
     # ---------- handlers ----------
+
+    # A single absurdly long line (minified JS, a huge JSON blob written on
+    # one line) stays under the line-count limit but can still blow the
+    # model's context budget by itself -- read_file only ever capped
+    # *lines* returned, never characters. MAX_READ_FILE_CHARS is a backstop
+    # for the same reason on the other axis: many long-but-under-the-cap
+    # lines can still add up to something huge.
+    MAX_LINE_CHARS = 2000
+    MAX_READ_FILE_CHARS = 100_000
 
     def _tool_read_file(self, inp: dict[str, Any]) -> str:
         path = self._require_str(inp, "path")
@@ -215,7 +275,14 @@ class ToolBox:
         total = len(lines)
         start = max(offset - 1, 0)
         chunk = lines[start:start + limit]
-        numbered = "\n".join(f"{start + i + 1:>6}\t{line}" for i, line in enumerate(chunk))
+        rendered = []
+        for i, line in enumerate(chunk):
+            if len(line) > self.MAX_LINE_CHARS:
+                line = line[:self.MAX_LINE_CHARS] + f"...[line truncated, {len(line)} chars total]"
+            rendered.append(f"{start + i + 1:>6}\t{line}")
+        numbered = "\n".join(rendered)
+        if len(numbered) > self.MAX_READ_FILE_CHARS:
+            numbered = numbered[:self.MAX_READ_FILE_CHARS] + "\n...[output truncated, use offset/limit to page further]"
         footer = f"\n[showing lines {start+1}-{start+len(chunk)} of {total}]"
         return (numbered or "[empty file]") + footer
 
@@ -224,7 +291,7 @@ class ToolBox:
         content = inp.get("content", "")
         if not isinstance(content, str):
             raise ToolError("content must be a string")
-        target = self._resolve(path)
+        target = self._resolve_for_write(path)
         target.parent.mkdir(parents=True, exist_ok=True)
         existed = target.exists()
         target.write_text(content, encoding="utf-8")
@@ -236,7 +303,7 @@ class ToolBox:
         new_str = inp.get("new_str", "")
         if not old_str:
             raise ToolError("old_str must not be empty")
-        target = self._resolve(path)
+        target = self._resolve_for_write(path)
         if not target.exists():
             raise ToolError(f"file does not exist: {path} (use write_file to create it)")
         content = target.read_text(encoding="utf-8", errors="replace")
@@ -306,20 +373,40 @@ class ToolBox:
 
     def _try_ripgrep(self, pattern: str, root: Path, max_results: int) -> str | None:
         import shutil as _shutil
+        import subprocess
         if _shutil.which("rg") is None:
             return None
-        result = self.ws.run_command(
-            f'rg -n --no-heading -e {_shell_quote(pattern)} {_shell_quote(str(root))} | head -n {max_results}',
-            timeout=30,
-        )
-        if result.exit_code not in (0, 1):  # rg returns 1 for "no matches", that's fine
+        try:
+            proc = subprocess.run(
+                ["rg", "-n", "--no-heading", "-e", pattern, str(root)],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=30,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return None  # fall through to the pure-Python search below
+        if proc.returncode not in (0, 1):  # rg returns 1 for "no matches", that's fine
             return None
-        out = result.stdout.strip()
-        return out if out else "[no matches]"
+        lines = proc.stdout.strip().splitlines()
+        if not lines:
+            return "[no matches]"
+        if len(lines) > max_results:
+            return "\n".join(lines[:max_results]) + f"\n... truncated at {max_results} results"
+        return "\n".join(lines)
 
-    def _tool_run_command(self, inp: dict[str, Any]) -> str:
-        command = self._require_str(inp, "command")
-        timeout = int(inp.get("timeout", self.config.budget.default_command_timeout))
+    def run_gated_command(self, command: str, timeout: int) -> CommandResult:
+        """Single chokepoint for executing a shell command against the
+        workspace: classify it against the approval policy and, if it needs
+        a human's OK, block for one before running anything.
+
+        This is the ONLY place a command is allowed to reach
+        Workspace.run_command from agent code. Both the run_command tool
+        and the agent's acceptance-command execution sites (propose_step's
+        acceptance_command, and the final declare_done acceptance check)
+        go through here, so the approval gate can't be bypassed just by
+        calling the workspace directly instead of going through a tool.
+        A denied command returns exit_code=1 with an explanatory stderr
+        rather than raising, matching how a real failing check looks.
+        """
         decision = classify_command(command, self.config.approval)
         approved = True
         if decision.needs_confirmation:
@@ -330,8 +417,16 @@ class ToolBox:
                     f"Agent wants to run:\n  {command}\nReason for asking: {decision.reason}"
                 ))
         if not approved:
-            return "[DENIED BY HUMAN] command was not run: " + command
-        result = self.ws.run_command(command, timeout=timeout)
+            return CommandResult(
+                command=command, exit_code=1, stdout="",
+                stderr="[DENIED BY HUMAN] command was not run", duration_s=0.0,
+            )
+        return self.ws.run_command(command, timeout=timeout)
+
+    def _tool_run_command(self, inp: dict[str, Any]) -> str:
+        command = self._require_str(inp, "command")
+        timeout = int(inp.get("timeout", self.config.budget.default_command_timeout))
+        result = self.run_gated_command(command, timeout)
         status = "TIMED OUT" if result.timed_out else f"exit code {result.exit_code}"
         return (f"$ {command}\n[{status}, {result.duration_s:.1f}s]\n"
                 f"--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}")
@@ -350,6 +445,31 @@ class ToolBox:
         question = self._require_str(inp, "question")
         return self._blocking_input(lambda: ask_human_question(question))
 
+    def _tool_record_decision(self, inp: dict[str, Any]) -> str:
+        decision = self._require_str(inp, "decision")
+        supersedes = inp.get("supersedes") or None
+        if supersedes is not None and not isinstance(supersedes, str):
+            raise ToolError("'supersedes' must be a string id if provided")
+        # _require_str already guarantees `decision` is non-empty, so
+        # DecisionsStore.add can only return None on blank input -- which
+        # can't happen here; the assert documents that invariant.
+        result = self.decisions.add(
+            decision=decision,
+            originating_step=self.current_context,
+            supersedes=supersedes,
+        )
+        assert result is not None
+        if supersedes and result.superseded_found is False:
+            return (
+                f"Recorded as new decision [{result.id}], but '{supersedes}' did not "
+                "match any active decision id, so nothing was superseded -- check the "
+                "id shown in the ACTIVE DECISIONS section and call record_decision "
+                "again with supersedes set correctly if that was intended."
+            )
+        if supersedes:
+            return f"Recorded [{result.id}], superseding [{supersedes}]."
+        return f"Recorded [{result.id}]."
+
     # mark_step_done/propose_step/declare_done are intentionally NOT handled
     # here -- agent.py intercepts those tool_use blocks before dispatch,
     # because acting on them requires the current step's acceptance-check
@@ -364,8 +484,3 @@ class ToolBox:
         if not isinstance(val, str) or not val:
             raise ToolError(f"'{key}' is required and must be a non-empty string")
         return val
-
-
-def _shell_quote(s: str) -> str:
-    import shlex
-    return shlex.quote(s)

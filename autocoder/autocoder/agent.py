@@ -112,6 +112,30 @@ MARK_STEP_DONE_TOOL = {
     },
 }
 
+DISCARD_AND_RESTART_TOOL = {
+    "name": "discard_and_restart",
+    "description": (
+        "Give up on the current approach and start this step over from a clean "
+        "slate. Your uncommitted edits are reverted back to the last passing "
+        "commit -- exactly like a failed mark_step_done -- but this does NOT "
+        "count against your attempt budget. Use this instead of continuing to "
+        "edit blind when you notice you're going in circles: repeated edits to "
+        "the same file without real progress, or you've realized your current "
+        "approach fundamentally can't work. Prefer this over patching more "
+        "guesses on top of an already-tangled state."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "reason": {
+                "type": "string",
+                "description": "What you were trying, and why it isn't working -- so you don't repeat it.",
+            },
+        },
+        "required": ["reason"],
+    },
+}
+
 DECLARE_DONE_TOOL = {
     "name": "declare_done",
     "description": (
@@ -160,7 +184,7 @@ OUTER_TOOLS = OUTER_WORKSPACE_TOOLS + [PROPOSE_STEP_TOOL, DECLARE_DONE_TOOL, UPD
 
 # Tools available inside an active step (executing it) -- full access,
 # because mark_step_done re-verifies with the real acceptance command.
-INNER_TOOLS = TOOL_SCHEMAS + [MARK_STEP_DONE_TOOL]
+INNER_TOOLS = TOOL_SCHEMAS + [MARK_STEP_DONE_TOOL, DISCARD_AND_RESTART_TOOL]
 
 
 # ── Agent ──────────────────────────────────────────────────────────────────
@@ -438,6 +462,7 @@ class Agent:
                     )
                     print(f"\n[step] {state.next_index()}: {title}")
                     print(f"  [check-will-run] {acceptance_cmd}")
+                    step_context.baseline_check_result = self._run_baseline_check(step_context)
                     # IMPORTANT: do not seed the coder with planner history.
                     # The structured StepContext is the explicit context boundary.
                     completed, failure_reason = self._inner_loop(state, step_context)
@@ -580,6 +605,39 @@ class Agent:
 
     # ── inner loop: execute one declared step ──────────────────────────────
 
+    def _run_baseline_check(self, step_context: StepContext) -> str:
+        """
+        Mechanical, model-agnostic: run acceptance_command once against the
+        untouched workspace, right when the step is proposed, before any
+        code changes exist. No interpretation of the result -- just the raw
+        exit code/stdout/stderr, formatted the same way a real failed
+        mark_step_done attempt's failure_detail already is, for consistency.
+
+        This exists so the coder starts from the real, actual result of its
+        own acceptance command instead of discovering it fresh after several
+        failed guesses -- and, as a free side effect of the same one call,
+        catches acceptance commands that already pass with no changes made
+        (a check that can't fail is as broken as one that can't pass).
+        """
+        result = self.toolbox.run_gated_command(
+            step_context.acceptance_command,
+            timeout=self.config.budget.default_command_timeout,
+        )
+        header = (
+            f"$ {step_context.acceptance_command}\n"
+            f"exit {result.exit_code}{' (TIMED OUT)' if result.timed_out else ''}\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        if result.exit_code == 0 and not result.timed_out:
+            return (
+                f"{header}\n\n"
+                "NOTE: this already exits 0 against the CURRENT workspace, before "
+                "any change has been made. Either this step isn't necessary, or "
+                "the acceptance command doesn't actually verify the new capability "
+                "-- double check it before proceeding."
+            )
+        return header
+
     def _inner_loop(
         self,
         state: RunState,
@@ -662,10 +720,11 @@ class Agent:
                     continue
 
                 mark_call = next((c for c in response.tool_calls if c.name == "mark_step_done"), None)
+                discard_call = next((c for c in response.tool_calls if c.name == "discard_and_restart"), None)
                 tool_results: list[ToolResult] = []
 
                 for call in response.tool_calls:
-                    if call.name == "mark_step_done":
+                    if call.name in ("mark_step_done", "discard_and_restart"):
                         continue
                     print(f"    [tool] {call.name}({_short(call.input)})")
                     try:
@@ -685,6 +744,28 @@ class Agent:
                         print(f"      -> ERROR: {e}")
                         tool_results.append(ToolResult(tool_call_id=call.id, content=f"ERROR: {e}", is_error=True))
                     self.session.log_event("tool_call", {"name": call.name})
+
+                if discard_call is not None:
+                    # Voluntary clean-slate reset -- deliberately does NOT
+                    # increment `attempts`. The whole point is to give a
+                    # cheap alternative to blindly patching on top of a
+                    # tangled state, so there's no cost that would make a
+                    # model avoid reaching for it (see mark_step_done's
+                    # revert-on-failure, which this is meant to complement,
+                    # not replace). The actual revert happens at the top of
+                    # the next attempt-loop iteration, same as the
+                    # BudgetExceeded path above -- not duplicated here.
+                    reason = discard_call.input.get("reason", "")
+                    print(f"    [discard] restarting step '{step_context.title}': {reason[:200]}")
+                    self.session.log_event("attempt_discarded", {"title": step_context.title, "reason": reason})
+                    repetition_guard.checkpoint()
+                    last_attempt_note = (
+                        f"A previous attempt called discard_and_restart: {reason}\n"
+                        "Its edits have been reverted -- you're starting from the last "
+                        "passing commit again, not from what it left behind. Take a "
+                        "genuinely different approach this time."
+                    )
+                    break  # fresh attempt, same as BudgetExceeded above -- attempts NOT incremented
 
                 if mark_call is not None:
                     attempts += 1
@@ -976,6 +1057,11 @@ small, targeted read_file regions around the relevant symbols or error locations
 Use workspace tools to implement this step. When ready, call mark_step_done.
 The harness verifies with the real acceptance command above -- your word alone is not enough.
 Read files before editing. edit_file requires an exact unique match for old_str.
+If you notice you're going in circles -- repeated edits to the same file with no
+real progress, or you've realized your current approach fundamentally can't work --
+call discard_and_restart instead of patching another guess on top of a tangled
+state. It reverts to the last passing commit and gives you a clean slate, at no
+cost to your attempt budget.
 """
 
     # ── summary ────────────────────────────────────────────────────────────

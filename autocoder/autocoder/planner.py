@@ -44,10 +44,22 @@ class StepContext:
     files: list[str] = field(default_factory=list)
     relevant_regions: list[str] = field(default_factory=list)
     findings: str = ""
+    # Filled in once, mechanically, before the coder ever sees this step:
+    # the harness runs acceptance_command against the untouched workspace
+    # and records exactly what happened. Not interpreted or classified --
+    # just the raw result, so the coder starts from the real baseline
+    # instead of discovering it after several blind guesses.
+    baseline_check_result: str = ""
 
     def prompt_text(self) -> str:
         files = "\n".join(f"  - {p}" for p in self.files) or "  (none specified -- locate as needed)"
         regions = "\n".join(f"  - {r}" for r in self.relevant_regions) or "  (none specified -- locate as needed)"
+        baseline = (
+            f"\n\nBASELINE (what ACCEPTANCE COMMAND produced when run against the "
+            f"CURRENT workspace, before you change anything -- this is your starting "
+            f"point, not a hint about what's wrong):\n{self.baseline_check_result}"
+            if self.baseline_check_result else ""
+        )
         return (
             f"STEP: {self.title}\n\n"
             f"OBJECTIVE:\n{self.objective}\n\n"
@@ -55,6 +67,7 @@ class StepContext:
             f"RELEVANT REGIONS / SYMBOLS:\n{regions}\n\n"
             f"PLANNER FINDINGS:\n{self.findings or '(none -- inspect the workspace yourself)'}\n\n"
             f"ACCEPTANCE COMMAND:\n  {self.acceptance_command}"
+            f"{baseline}"
         )
 
 

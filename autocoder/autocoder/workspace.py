@@ -17,7 +17,9 @@ Isolation that does NOT exist (be aware):
 """
 from __future__ import annotations
 
+import os
 import shutil
+import signal
 import subprocess
 import time
 from dataclasses import dataclass
@@ -38,32 +40,109 @@ class CommandResult:
     timed_out: bool = False
 
 
+def _kill_process_tree(proc: "subprocess.Popen") -> None:
+    """
+    Kill the whole process tree, not just the immediate child.
+
+    proc.kill() alone only reaches the process we spawned directly. With
+    shell=True on Windows that's cmd.exe -- the real command (e.g. `python
+    script.py`) runs as cmd.exe's own child, a grandchild of ours, and is
+    never touched by proc.kill(). Confirmed in practice: that grandchild
+    was left running, orphaned, inheriting the same stdout/stderr pipes we
+    were reading from -- so even after cmd.exe died, communicate() kept
+    blocking forever waiting for a pipe EOF that couldn't happen until the
+    orphan also exited. The timeout= we passed in couldn't rescue that; it
+    isn't a logic bug on our side, it's what shell=True does on Windows.
+
+    On POSIX the child was launched with start_new_session=True (see
+    _run), which puts it and everything it spawns in its own process
+    group -- os.killpg reaches all of them, including anything it
+    backgrounded or detached.
+    """
+    if os.name == "nt":
+        # taskkill /T recurses into the whole tree; plain proc.kill() does not.
+        subprocess.run(
+            ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+            capture_output=True, timeout=10,
+        )
+    else:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+
+
 def _run(cmd: list[str] | str, cwd: Path, timeout: int, shell: bool) -> CommandResult:
     start = time.time()
+    command_str = cmd if isinstance(cmd, str) else " ".join(cmd)
+    popen_kwargs: dict = dict(
+        cwd=str(cwd),
+        shell=shell,
+        # Never let a spawned command block on stdin. Nothing running
+        # headless under this harness has a legitimate reason to want
+        # interactive input, and a command that reads from stdin without
+        # us setting this inherits our own stdin and can hang forever
+        # waiting for input that will never come -- indistinguishable
+        # from a genuinely slow command until you check whether it's
+        # actually using any CPU (it won't be).
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    # So _kill_process_tree can reach every descendant, not just the
+    # process we spawn directly -- see its docstring.
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        popen_kwargs["start_new_session"] = True
+
     try:
-        proc = subprocess.run(
-            cmd,
-            cwd=str(cwd),
-            shell=shell,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
-        )
+        proc = subprocess.Popen(cmd, **popen_kwargs)
+    except OSError as e:
         return CommandResult(
-            command=cmd if isinstance(cmd, str) else " ".join(cmd),
-            exit_code=proc.returncode,
-            stdout=proc.stdout[-20000:],  # cap so one runaway command can't blow the context
-            stderr=proc.stderr[-20000:],
+            command=command_str,
+            exit_code=-1,
+            stdout="",
+            stderr=(
+                f"{type(e).__name__}: {e}\n"
+                "This usually means the command line itself could not be launched by the "
+                "OS -- often because it's too long (Windows has a hard command-line length "
+                "limit) or references something that doesn't exist. Try a shorter command, "
+                "or write a script to a file and run that file instead of one long inline command."
+            ),
             duration_s=time.time() - start,
         )
-    except subprocess.TimeoutExpired as e:
+
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
         return CommandResult(
-            command=cmd if isinstance(cmd, str) else " ".join(cmd),
+            command=command_str,
+            exit_code=proc.returncode,
+            stdout=(stdout or "")[-20000:],  # cap so one runaway command can't blow the context
+            stderr=(stderr or "")[-20000:],
+            duration_s=time.time() - start,
+        )
+    except subprocess.TimeoutExpired:
+        _kill_process_tree(proc)
+        # Now that every process holding the pipes is actually dead, this
+        # drains whatever partial output exists and returns promptly --
+        # it does not re-block the way the first call did.
+        try:
+            stdout, stderr = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            stdout, stderr = "", ""
+        return CommandResult(
+            command=command_str,
             exit_code=-1,
-            stdout=(e.stdout or "")[-20000:] if isinstance(e.stdout, str) else "",
-            stderr=(e.stderr or "")[-20000:] if isinstance(e.stderr, str) else "",
+            stdout=(stdout or "")[-20000:],
+            stderr=(stderr or "")[-20000:],
             duration_s=time.time() - start,
             timed_out=True,
         )
@@ -76,8 +155,9 @@ def _run(cmd: list[str] | str, cwd: Path, timeout: int, shell: bool) -> CommandR
         # caught. OSError is the base class for that and other real launch
         # failures (permission errors, missing interpreter, etc.) -- report
         # them as a normal failed command instead of an unhandled crash.
+        _kill_process_tree(proc)
         return CommandResult(
-            command=cmd if isinstance(cmd, str) else " ".join(cmd),
+            command=command_str,
             exit_code=-1,
             stdout="",
             stderr=(
@@ -92,6 +172,16 @@ def _run(cmd: list[str] | str, cwd: Path, timeout: int, shell: bool) -> CommandR
 
 
 class Workspace:
+    # Directories the harness manages itself and the model must never write
+    # into directly: .git/ because a hook planted here (e.g.
+    # .git/hooks/post-commit) is auto-executing code the harness triggers
+    # itself on every `git commit` -- a clean bypass of the approval gate,
+    # since nothing re-checks a hook before it runs. .autocoder/ because
+    # it's the agent's own resumable session state (goal, completed-step
+    # log); letting the model rewrite it defeats its purpose as a record
+    # of what actually happened.
+    _PROTECTED_WRITE_DIRS = (".git", ".autocoder")
+
     def __init__(self, root: Path):
         self.root = root
 
@@ -206,6 +296,20 @@ class Workspace:
         except ValueError:
             raise WorkspaceError(
                 f"path '{relative_path}' resolves outside the workspace ({self.root}); refused"
+            )
+        return candidate
+
+    def resolve_for_write(self, relative_path: str) -> Path:
+        """Like resolve(), but additionally refuses to write inside a
+        protected directory (see _PROTECTED_WRITE_DIRS). Read access
+        through resolve() is unaffected -- this is specifically for the
+        tools that create or modify files."""
+        candidate = self.resolve(relative_path)
+        rel_parts = candidate.relative_to(self.root.resolve()).parts
+        if rel_parts and rel_parts[0] in self._PROTECTED_WRITE_DIRS:
+            raise WorkspaceError(
+                f"path '{relative_path}' is inside the protected '{rel_parts[0]}/' "
+                "directory and cannot be written to"
             )
         return candidate
 

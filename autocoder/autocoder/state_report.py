@@ -39,11 +39,26 @@ def compact_history_with_state_report(
 
     If history is already short enough that there's nothing old to drop,
     returns history unchanged.
+
+    The cut is tool-pair aware: a "tool_results" turn always answers the
+    "assistant" turn immediately before it (tool_calls -> tool_results are
+    appended as a matched pair, one turn each, every iteration of both
+    loops). If a fixed-size window happened to start ON a tool_results
+    turn whose answering assistant turn falls just outside the window,
+    that assistant turn would be dropped and the kept tool_results would
+    be orphaned -- invalid on the wire (a "tool" role message with no
+    preceding tool_calls), and confusing to the model even when a lenient
+    server tolerates it. When that would happen, the window is widened by
+    one turn to pull the assistant turn back in, rather than cutting the
+    tool_results turn away entirely and losing that context.
     """
     if len(history) <= keep_recent_turns + 1:
         return history
 
     seed = history[0]
-    recent = history[-keep_recent_turns:]
+    start = len(history) - keep_recent_turns
+    if start > 0 and history[start].role == "tool_results" and history[start - 1].role == "assistant":
+        start -= 1
+    recent = history[start:]
     report_turn = Turn(role="user", text=state_report)
     return [seed, report_turn, *recent]
