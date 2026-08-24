@@ -1,3 +1,4 @@
+import json
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -299,6 +300,55 @@ def test_scratchpad_persists_across_steps(tmp_path):
 
     assert state.status == "done"
     assert "remember: need b.py next" in state.scratchpad
+
+
+def test_decision_recorded_in_step_one_reaches_step_two_coder_prompt_verbatim(tmp_path):
+    """
+    The propagation guarantee the decisions store exists for: a decision
+    recorded via record_decision during step one's inner loop must show up,
+    verbatim, in step two's inner-loop system prompt -- with the planner
+    never restating it anywhere in step two's objective/findings text.
+    """
+    llm = FakeLLMClient([
+        # outer turn 1: propose step one
+        tool_response("propose_step", {
+            "title": "Step one",
+            "acceptance_command": "python -c \"pass\"",
+        }),
+        # inner step one, attempt 1: record a decision, then mark done.
+        # Deliberately no write_file -- the acceptance command doesn't need one.
+        tool_response("record_decision", {"decision": "Use SQLAlchemy ORM, not raw sqlite3"}, call_id="i1"),
+        tool_response("mark_step_done", {"summary": "recorded the ORM decision"}, call_id="i2"),
+        # outer turn 2: propose step two -- objective says nothing about SQLAlchemy
+        tool_response("propose_step", {
+            "title": "Step two",
+            "acceptance_command": "python -c \"pass\"",
+        }),
+        # inner step two, attempt 1: this is the system prompt under test
+        tool_response("mark_step_done", {"summary": "step two done"}, call_id="i3"),
+        # outer turn 3: declare done
+        tool_response("declare_done", {"summary": "all done"}, call_id="o3"),
+    ])
+
+    agent = Agent(make_config(tmp_path), llm=llm)
+    state = agent.run(goal="build the thing", resume=False,
+                      final_acceptance_command="python -c \"pass\"")
+
+    assert state.status == "done"
+    assert len(state.completed_steps) == 2
+
+    # find the inner-loop system prompt for step two's first attempt: the
+    # call whose history opens with step two's StepContext, not step one's.
+    step_two_calls = [
+        c for c in llm.calls
+        if c["history"] and "Step two" in (c["history"][0].text or "")
+    ]
+    assert step_two_calls, "expected at least one LLM call scoped to step two"
+    step_two_system = step_two_calls[0]["system"]
+
+    assert "Use SQLAlchemy ORM, not raw sqlite3" in step_two_system
+    # and the planner's own step-two framing never had to restate it
+    assert "SQLAlchemy" not in step_two_calls[0]["history"][0].text
 
 
 def test_declare_done_human_rejection_feedback_reaches_model(tmp_path, monkeypatch):
@@ -1013,3 +1063,464 @@ def test_outer_loop_state_report_compaction_fires_with_live_facts(tmp_path):
     assert "Git status" in found_report
 
 
+
+
+def test_declare_done_rejected_when_a_later_step_regresses_an_earlier_one(tmp_path):
+    """M2 regression: step 2's own acceptance command (compiling other.py)
+    doesn't notice that step 2 also broke hello.py, which step 1 already
+    verified. Without re-running prior acceptance commands at declare_done
+    time, this would be silently accepted. The model must be told about
+    the regression and get a chance to fix it before the run can end."""
+    llm = FakeLLMClient([
+        # outer 1: propose step 1 -- create hello.py
+        tool_response("propose_step", {
+            "title": "Create hello.py",
+            "acceptance_command": "python -m py_compile hello.py",
+        }),
+        tool_response("write_file", {"path": "hello.py", "content": "print('hi')\n"}, call_id="i1"),
+        tool_response("mark_step_done", {"summary": "wrote hello.py"}, call_id="i2"),
+
+        # outer 2: propose step 2 -- creates other.py, but ALSO corrupts
+        # hello.py as a side effect. Step 2's own acceptance command only
+        # checks other.py, so it passes without noticing.
+        tool_response("propose_step", {
+            "title": "Create other.py",
+            "acceptance_command": "python -m py_compile other.py",
+        }, call_id="o2"),
+        tool_response("write_file", {"path": "hello.py", "content": "def broken(:\n"}, call_id="i3"),
+        tool_response("write_file", {"path": "other.py", "content": "print('ok')\n"}, call_id="i4"),
+        tool_response("mark_step_done", {"summary": "wrote other.py"}, call_id="i5"),
+
+        # outer 3: declare done -- must be REJECTED, hello.py regressed
+        tool_response("declare_done", {"summary": "all done"}, call_id="o3"),
+
+        # outer 4: model fixes hello.py via a new step
+        tool_response("propose_step", {
+            "title": "Fix hello.py",
+            "acceptance_command": "python -m py_compile hello.py",
+        }, call_id="o4"),
+        tool_response("write_file", {"path": "hello.py", "content": "print('fixed')\n"}, call_id="i6"),
+        tool_response("mark_step_done", {"summary": "fixed hello.py"}, call_id="i7"),
+
+        # outer 5: declare done again -- now accepted
+        tool_response("declare_done", {"summary": "all done, for real"}, call_id="o5"),
+    ])
+
+    agent = Agent(make_config(tmp_path), llm=llm)
+    state = agent.run(goal="build stuff", resume=False,
+                      final_acceptance_command="python -m py_compile hello.py")
+
+    assert state.status == "done"
+    assert len(state.completed_steps) == 3
+    assert (agent.workspace.root / "hello.py").read_text() == "print('fixed')\n"
+
+    # the rejection feedback must have actually reached the model, not just
+    # been printed and discarded -- check every Turn sent in every call for
+    # a tool_results entry mentioning the regression
+    feedback_seen = any(
+        "Regression detected" in tr.content
+        for call in llm.calls
+        for turn in call["history"]
+        for tr in turn.tool_results
+    )
+    assert feedback_seen, "regression feedback never appeared in any prompt sent to the model"
+
+
+def test_declare_done_with_no_completed_steps_skips_regression_check(tmp_path):
+    """Zero completed steps means nothing to regress -- declare_done should
+    behave exactly as before (governed only by final_acceptance_command)."""
+    llm = FakeLLMClient([
+        tool_response("declare_done", {"summary": "trivially done"}),
+    ])
+    agent = Agent(make_config(tmp_path), llm=llm)
+    state = agent.run(goal="do nothing", resume=False, final_acceptance_command="python -c \"pass\"")
+    assert state.status == "done"
+    assert state.completed_steps == []
+
+
+def test_failed_attempt_junk_is_reverted_before_next_retry(tmp_path):
+    """M3 regression: a failed attempt writes a stray file it never meant
+    to keep (e.g. scratch/debug output) alongside a broken hello.py. The
+    NEXT attempt fixes hello.py and passes -- without the revert, the
+    stray file would get swept into that passing commit by `git add -A`.
+    With the revert, the stray file must not exist after the step lands."""
+    llm = FakeLLMClient([
+        tool_response("propose_step", {
+            "title": "Create hello.py",
+            "acceptance_command": "python -m py_compile hello.py",
+        }),
+        # attempt 1: writes a broken hello.py AND an unrelated stray file, then fails the check
+        tool_response("write_file", {"path": "hello.py", "content": "def broken(:\n"}, call_id="i1"),
+        tool_response("write_file", {"path": "stray_debug.txt", "content": "oops\n"}, call_id="i2"),
+        tool_response("mark_step_done", {"summary": "attempt 1"}, call_id="i3"),
+        # attempt 2: fixes hello.py correctly and passes
+        tool_response("write_file", {"path": "hello.py", "content": "print('hi')\n"}, call_id="i4"),
+        tool_response("mark_step_done", {"summary": "attempt 2"}, call_id="i5"),
+        tool_response("declare_done", {"summary": "done"}, call_id="o2"),
+    ])
+
+    agent = Agent(make_config(tmp_path, max_subtask_attempts=3), llm=llm)
+    state = agent.run(goal="make hello.py", resume=False,
+                      final_acceptance_command="python -m py_compile hello.py")
+
+    assert state.status == "done"
+    assert (agent.workspace.root / "hello.py").read_text() == "print('hi')\n"
+    # attempt 1's stray file must NOT have survived into the passing commit
+    assert not (agent.workspace.root / "stray_debug.txt").exists()
+
+
+def test_first_attempt_revert_is_a_harmless_noop(tmp_path):
+    """Reverting on the very first attempt (nothing to revert yet) must
+    not error or discard anything from before the step started."""
+    llm = FakeLLMClient([
+        tool_response("propose_step", {
+            "title": "Create hello.py",
+            "acceptance_command": "python -m py_compile hello.py",
+        }),
+        tool_response("write_file", {"path": "hello.py", "content": "print('hi')\n"}, call_id="i1"),
+        tool_response("mark_step_done", {"summary": "wrote it"}, call_id="i2"),
+        tool_response("declare_done", {"summary": "done"}, call_id="o1"),
+    ])
+    agent = Agent(make_config(tmp_path), llm=llm)
+    state = agent.run(goal="make hello.py", resume=False,
+                      final_acceptance_command="python -m py_compile hello.py")
+    assert state.status == "done"
+    assert (agent.workspace.root / "hello.py").read_text() == "print('hi')\n"
+
+
+def test_call_llm_trims_oversized_history_before_sending(tmp_path):
+    """A wiring regression: llm.trim_history_to_fit existed but was never
+    actually called anywhere -- imported into agent.py, never invoked.
+    The only overflow protection was compact_history_with_state_report,
+    which runs AFTER a call returns, not before the next one goes out.
+    This asserts every prompt _call_llm actually sends stays within
+    budget, using a tiny context window to force the gap to matter, and
+    checks against llm.count_tokens -- the exact function _call_llm
+    actually calls -- not a separate re-derived estimate."""
+    llm = FakeLLMClient([
+        tool_response("read_file", {"path": "big.txt"}, call_id="r1"),
+        tool_response("propose_step", {
+            "title": "noop", "acceptance_command": "python -c \"pass\"",
+        }, call_id="o2"),
+        tool_response("write_file", {"path": "x.txt", "content": "ok\n"}, call_id="i1"),
+        tool_response("mark_step_done", {"summary": "done"}, call_id="i2"),
+        tool_response("declare_done", {"summary": "all done"}, call_id="o3"),
+    ])
+
+    config = make_config(tmp_path)
+    config.llm.context_window_tokens = 4000
+    config.budget.max_output_tokens = 1000
+    agent = Agent(config, llm=llm)
+
+    (agent.workspace.root / "big.txt").write_text("y" * 20_000, encoding="utf-8")
+
+    state = agent.run(goal="do something small", resume=False,
+                      final_acceptance_command="python -c \"pass\"")
+
+    assert state.status == "done"
+
+    budget_tokens = max(config.llm.context_window_tokens - config.budget.max_output_tokens, 1)
+    for call in llm.calls:
+        size = llm.count_tokens(call["system"], call["history"], None)
+        assert size <= budget_tokens, (
+            f"a prompt of {size} tokens went out against a {budget_tokens}-token budget -- "
+            "trim_history_to_fit isn't actually being applied before the call"
+        )
+
+
+def test_scratchpad_writes_are_capped(tmp_path):
+    """The scratchpad lives in plain Turn.text (the outer loop's
+    context_msg), not a tool_results entry -- trim_history_to_fit can
+    never shrink it. It has no other size limit and is fully
+    model-writable via update_scratchpad, so an unbounded write must be
+    capped at the write site itself."""
+    llm = FakeLLMClient([
+        tool_response("update_scratchpad", {"scratchpad": "z" * 50_000}, call_id="s1"),
+        tool_response("declare_done", {"summary": "done"}, call_id="o2"),
+    ])
+    agent = Agent(make_config(tmp_path), llm=llm)
+    state = agent.run(goal="test scratchpad cap", resume=False,
+                      final_acceptance_command="python -c \"pass\"")
+    assert state.status == "done"
+    assert len(state.scratchpad) <= Agent.MAX_SCRATCHPAD_CHARS + 100  # + truncation marker
+
+
+def _first_inner_system_prompt_for(llm, title):
+    calls = [c for c in llm.calls if c["history"] and f"STEP: {title}" in (c["history"][0].text or "")]
+    assert calls, f"expected at least one LLM call scoped to step {title!r}"
+    return calls[0]["system"]
+
+
+def test_baseline_check_surfaces_real_failure_before_any_work(tmp_path):
+    """
+    The harness runs acceptance_command once, mechanically, right when the
+    step is proposed -- before the coder has touched anything -- and the
+    raw result (not an interpretation of it) must be visible in the first
+    inner-loop system prompt.
+    """
+    llm = FakeLLMClient([
+        tool_response("propose_step", {
+            "title": "Create marker file",
+            "acceptance_command": (
+                "python -c \"import pathlib,sys; "
+                "sys.exit(0 if pathlib.Path('marker.txt').exists() else 1)\""
+            ),
+        }),
+        tool_response("write_file", {"path": "marker.txt", "content": "x"}, call_id="i1"),
+        tool_response("mark_step_done", {"summary": "created marker.txt"}, call_id="i2"),
+        tool_response("declare_done", {"summary": "done"}, call_id="o2"),
+    ])
+    agent = Agent(make_config(tmp_path), llm=llm)
+    state = agent.run(goal="g", resume=False, final_acceptance_command="python -c \"pass\"")
+
+    assert state.status == "done"
+    system = _first_inner_system_prompt_for(llm, "Create marker file")
+    assert "BASELINE" in system
+    assert "exit 1" in system  # marker.txt didn't exist yet when the baseline ran
+
+
+def test_baseline_check_flags_a_check_that_already_passes(tmp_path):
+    """A check that exits 0 before any change is made is as broken as one
+    that can never pass -- this is a plain exit-code fact, not a judgment
+    call, so it's safe to surface mechanically."""
+    llm = FakeLLMClient([
+        tool_response("propose_step", {
+            "title": "Vacuous step",
+            "acceptance_command": "python -c \"pass\"",
+        }),
+        tool_response("mark_step_done", {"summary": "nothing to do"}, call_id="i1"),
+        tool_response("declare_done", {"summary": "done"}, call_id="o2"),
+    ])
+    agent = Agent(make_config(tmp_path), llm=llm)
+    state = agent.run(goal="g", resume=False, final_acceptance_command="python -c \"pass\"")
+
+    assert state.status == "done"
+    system = _first_inner_system_prompt_for(llm, "Vacuous step")
+    assert "already exits 0" in system
+
+
+def test_discard_and_restart_does_not_count_against_attempt_budget(tmp_path):
+    """
+    max_subtask_attempts=1 means exactly one mark_step_done attempt is
+    allowed. If discard_and_restart silently counted as an attempt, the
+    mark_step_done below would be attempt #2 and the step would fail.
+    It should succeed instead -- proving discard_and_restart is free.
+    """
+    llm = FakeLLMClient([
+        tool_response("propose_step", {
+            "title": "Write good.txt, not bad.txt",
+            "acceptance_command": (
+                "python -c \"import pathlib,sys; "
+                "sys.exit(1 if pathlib.Path('bad.txt').exists() else "
+                "(0 if pathlib.Path('good.txt').exists() else 1))\""
+            ),
+        }),
+        # wrong approach first
+        tool_response("write_file", {"path": "bad.txt", "content": "oops"}, call_id="i1"),
+        tool_response("discard_and_restart", {"reason": "wrong file, starting over"}, call_id="i2"),
+        # fresh attempt -- history resets, this is a new LLM call scoped to the same step
+        tool_response("write_file", {"path": "good.txt", "content": "ok"}, call_id="i3"),
+        tool_response("mark_step_done", {"summary": "wrote good.txt"}, call_id="i4"),
+        tool_response("declare_done", {"summary": "done"}, call_id="o2"),
+    ])
+    agent = Agent(make_config(tmp_path, max_subtask_attempts=1), llm=llm)
+    state = agent.run(goal="g", resume=False, final_acceptance_command="python -c \"pass\"")
+
+    assert state.status == "done"
+    assert len(state.completed_steps) == 1
+    ws = agent.config.workspace_root
+    assert not (ws / "bad.txt").exists()  # reverted
+    assert (ws / "good.txt").exists()
+
+
+def test_discard_and_restart_logs_an_event_with_the_reason(tmp_path):
+    llm = FakeLLMClient([
+        tool_response("propose_step", {
+            "title": "Retry step",
+            "acceptance_command": "python -c \"pass\"",
+        }),
+        tool_response("discard_and_restart", {"reason": "changed my mind"}, call_id="i1"),
+        tool_response("mark_step_done", {"summary": "done"}, call_id="i2"),
+        tool_response("declare_done", {"summary": "done"}, call_id="o2"),
+    ])
+    config = make_config(tmp_path)
+    agent = Agent(config, llm=llm)
+    state = agent.run(goal="g", resume=False, final_acceptance_command="python -c \"pass\"")
+
+    assert state.status == "done"
+    events = [json.loads(line) for line in config.log_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+    discarded = [e for e in events if e.get("kind") == "attempt_discarded"]
+    assert len(discarded) == 1
+    assert discarded[0]["reason"] == "changed my mind"
+    assert discarded[0]["title"] == "Retry step"
+
+
+def test_revise_acceptance_command_swaps_the_check_and_reruns_baseline(tmp_path):
+    """
+    The whole point: a step whose original acceptance_command can never
+    pass (references a file that will never exist) succeeds once the
+    model revises it to something correct -- proving the swap actually
+    takes effect for the mark_step_done check that follows.
+    """
+    llm = FakeLLMClient([
+        tool_response("propose_step", {
+            "title": "Broken check",
+            "acceptance_command": (
+                "python -c \"import pathlib,sys; "
+                "sys.exit(0 if pathlib.Path('this_will_never_exist.xyz').exists() else 1)\""
+            ),
+        }),
+        tool_response("revise_acceptance_command", {
+            "new_acceptance_command": "python -c \"pass\"",
+            "reason": "original check referenced a file nothing in this step creates",
+        }, call_id="i1"),
+        tool_response("mark_step_done", {"summary": "corrected the check"}, call_id="i2"),
+        tool_response("declare_done", {"summary": "done"}, call_id="o2"),
+    ])
+    agent = Agent(make_config(tmp_path), llm=llm)
+    state = agent.run(goal="g", resume=False, final_acceptance_command="python -c \"pass\"")
+
+    assert state.status == "done"
+    assert len(state.completed_steps) == 1
+    completed = state.completed_steps[0]
+    assert completed.acceptance_command == "python -c \"pass\""
+    assert completed.original_acceptance_command == (
+        "python -c \"import pathlib,sys; "
+        "sys.exit(0 if pathlib.Path('this_will_never_exist.xyz').exists() else 1)\""
+    )
+
+
+def test_revise_acceptance_command_is_capped_at_one_per_step(tmp_path):
+    llm = FakeLLMClient([
+        tool_response("propose_step", {
+            "title": "Two revisions attempted",
+            "acceptance_command": "python -c \"pass\"",
+        }),
+        tool_response("revise_acceptance_command", {
+            "new_acceptance_command": "python -c \"pass\"",
+            "reason": "first revision",
+        }, call_id="i1"),
+        tool_response("revise_acceptance_command", {
+            "new_acceptance_command": "python -c \"import sys; sys.exit(1)\"",
+            "reason": "second revision, should be rejected",
+        }, call_id="i2"),
+        tool_response("mark_step_done", {"summary": "done"}, call_id="i3"),
+        tool_response("declare_done", {"summary": "done"}, call_id="o2"),
+    ])
+    agent = Agent(make_config(tmp_path), llm=llm)
+    state = agent.run(goal="g", resume=False, final_acceptance_command="python -c \"pass\"")
+
+    assert state.status == "done"
+    # the second (rejected) revision must NOT have taken effect -- the
+    # step must still pass with the command from the first revision
+    assert state.completed_steps[0].acceptance_command == "python -c \"pass\""
+
+    calls = [c for c in llm.calls if c["history"] and "Two revisions attempted" in (c["history"][0].text or "")]
+    tool_result_texts = []
+    for c in calls:
+        for t in c["history"]:
+            if t.role == "tool_results":
+                tool_result_texts.extend(r.content for r in t.tool_results)
+    assert any("already been revised once" in t for t in tool_result_texts)
+
+
+def test_revise_acceptance_command_does_not_reset_repetition_guard_or_history(tmp_path):
+    """Unlike discard_and_restart, revising the check should NOT wipe the
+    in-progress attempt -- the model's prior work in this attempt should
+    still be visible in the next turn's history."""
+    llm = FakeLLMClient([
+        tool_response("propose_step", {
+            "title": "Same attempt continues",
+            "acceptance_command": "python -c \"import sys; sys.exit(1)\"",
+        }),
+        tool_response("write_file", {"path": "marker.txt", "content": "x"}, call_id="i1"),
+        tool_response("revise_acceptance_command", {
+            "new_acceptance_command": (
+                "python -c \"import pathlib,sys; "
+                "sys.exit(0 if pathlib.Path('marker.txt').exists() else 1)\""
+            ),
+            "reason": "original check was unconditionally failing, unrelated to the work",
+        }, call_id="i2"),
+        tool_response("mark_step_done", {"summary": "done"}, call_id="i3"),
+        tool_response("declare_done", {"summary": "done"}, call_id="o2"),
+    ])
+    agent = Agent(make_config(tmp_path), llm=llm)
+    state = agent.run(goal="g", resume=False, final_acceptance_command="python -c \"pass\"")
+
+    assert state.status == "done"
+    assert (agent.config.workspace_root / "marker.txt").exists()
+
+
+def test_acceptance_command_revised_event_logs_old_new_and_reason(tmp_path):
+    llm = FakeLLMClient([
+        tool_response("propose_step", {
+            "title": "Loggable revision",
+            "acceptance_command": "python -c \"import sys; sys.exit(1)\"",
+        }),
+        tool_response("revise_acceptance_command", {
+            "new_acceptance_command": "python -c \"pass\"",
+            "reason": "old command always failed regardless of implementation",
+        }, call_id="i1"),
+        tool_response("mark_step_done", {"summary": "done"}, call_id="i2"),
+        tool_response("declare_done", {"summary": "done"}, call_id="o2"),
+    ])
+    config = make_config(tmp_path)
+    agent = Agent(config, llm=llm)
+    state = agent.run(goal="g", resume=False, final_acceptance_command="python -c \"pass\"")
+
+    assert state.status == "done"
+    events = [json.loads(line) for line in config.log_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+    revised = [e for e in events if e.get("kind") == "acceptance_command_revised"]
+    assert len(revised) == 1
+    assert revised[0]["old_command"] == "python -c \"import sys; sys.exit(1)\""
+    assert revised[0]["new_command"] == "python -c \"pass\""
+    assert revised[0]["reason"] == "old command always failed regardless of implementation"
+    assert revised[0]["title"] == "Loggable revision"
+
+
+def test_failed_mark_step_done_tells_the_model_its_edits_were_reverted(tmp_path):
+    """
+    Regression: a failed mark_step_done silently reverts the workspace
+    (agent.py's git_revert_to_last_commit call), but the model was never
+    actually told that happened in the common case of continuing the same
+    attempt -- last_attempt_note only ever reached history on a fresh
+    attempt, which this path doesn't take. Confirmed against a real run:
+    the model cited a stale "36 passed" result from before an unannounced
+    revert and burned its remaining budget confused about missing files.
+    The tool_result shown for every failed check must say so directly.
+    """
+    llm = FakeLLMClient([
+        tool_response("propose_step", {
+            "title": "Create good.txt",
+            "acceptance_command": (
+                "python -c \"import pathlib,sys; "
+                "sys.exit(0 if pathlib.Path('good.txt').exists() else 1)\""
+            ),
+        }),
+        # wrong file first -- this attempt will fail
+        tool_response("write_file", {"path": "wrong.txt", "content": "oops"}, call_id="i1"),
+        tool_response("mark_step_done", {"summary": "wrote wrong.txt"}, call_id="i2"),
+        # same attempt continues (no break) -- this is exactly the path
+        # that used to leave the model uninformed
+        tool_response("write_file", {"path": "good.txt", "content": "ok"}, call_id="i3"),
+        tool_response("mark_step_done", {"summary": "wrote good.txt"}, call_id="i4"),
+        tool_response("declare_done", {"summary": "done"}, call_id="o2"),
+    ])
+    agent = Agent(make_config(tmp_path), llm=llm)
+    state = agent.run(goal="g", resume=False, final_acceptance_command="python -c \"pass\"")
+
+    assert state.status == "done"
+    ws = agent.config.workspace_root
+    assert not (ws / "wrong.txt").exists()  # actually reverted
+    assert (ws / "good.txt").exists()
+
+    calls = [c for c in llm.calls if c["history"] and "Create good.txt" in (c["history"][0].text or "")]
+    tool_result_texts = []
+    for c in calls:
+        for t in c["history"]:
+            if t.role == "tool_results":
+                tool_result_texts.extend(r.content for r in t.tool_results)
+    failure_texts = [t for t in tool_result_texts if "Acceptance check FAILED" in t]
+    assert failure_texts, "expected at least one failed-check tool_result"
+    assert any("reverted" in t for t in failure_texts)
+    assert any("re-verify" in t or "no longer reflects" in t for t in failure_texts)
