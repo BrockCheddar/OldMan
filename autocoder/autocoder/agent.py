@@ -136,6 +136,38 @@ DISCARD_AND_RESTART_TOOL = {
     },
 }
 
+REVISE_ACCEPTANCE_COMMAND_TOOL = {
+    "name": "revise_acceptance_command",
+    "description": (
+        "Replace acceptance_command for THIS step with a corrected one, when you "
+        "have concrete evidence the CHECK ITSELF is wrong -- not that your "
+        "implementation is failing it. Evidence means something specific: the "
+        "check references something that can never exist (a wrong assumption "
+        "about a library's structure), depends on a program not available on "
+        "this platform, or checks a path/location that can't be right. 'It keeps "
+        "failing' is NOT evidence the check is wrong -- that's normal debugging; "
+        "keep working and call mark_step_done again. This does NOT let you "
+        "verify something new the step didn't originally cover -- that belongs "
+        "in a future step, not a rewritten check. Usable ONCE per step. You will "
+        "get back a fresh baseline result for the new command, same as the one "
+        "you saw when this step started."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "new_acceptance_command": {
+                "type": "string",
+                "description": "The corrected command. Must still verify the same thing the step was meant to verify.",
+            },
+            "reason": {
+                "type": "string",
+                "description": "The concrete evidence the old command was wrong (not just failing).",
+            },
+        },
+        "required": ["new_acceptance_command", "reason"],
+    },
+}
+
 DECLARE_DONE_TOOL = {
     "name": "declare_done",
     "description": (
@@ -184,7 +216,7 @@ OUTER_TOOLS = OUTER_WORKSPACE_TOOLS + [PROPOSE_STEP_TOOL, DECLARE_DONE_TOOL, UPD
 
 # Tools available inside an active step (executing it) -- full access,
 # because mark_step_done re-verifies with the real acceptance command.
-INNER_TOOLS = TOOL_SCHEMAS + [MARK_STEP_DONE_TOOL, DISCARD_AND_RESTART_TOOL]
+INNER_TOOLS = TOOL_SCHEMAS + [MARK_STEP_DONE_TOOL, DISCARD_AND_RESTART_TOOL, REVISE_ACCEPTANCE_COMMAND_TOOL]
 
 
 # ── Agent ──────────────────────────────────────────────────────────────────
@@ -463,6 +495,7 @@ class Agent:
                     print(f"\n[step] {state.next_index()}: {title}")
                     print(f"  [check-will-run] {acceptance_cmd}")
                     step_context.baseline_check_result = self._run_baseline_check(step_context)
+                    step_context.original_acceptance_command = step_context.acceptance_command
                     # IMPORTANT: do not seed the coder with planner history.
                     # The structured StepContext is the explicit context boundary.
                     completed, failure_reason = self._inner_loop(state, step_context)
@@ -721,10 +754,11 @@ class Agent:
 
                 mark_call = next((c for c in response.tool_calls if c.name == "mark_step_done"), None)
                 discard_call = next((c for c in response.tool_calls if c.name == "discard_and_restart"), None)
+                revise_call = next((c for c in response.tool_calls if c.name == "revise_acceptance_command"), None)
                 tool_results: list[ToolResult] = []
 
                 for call in response.tool_calls:
-                    if call.name in ("mark_step_done", "discard_and_restart"):
+                    if call.name in ("mark_step_done", "discard_and_restart", "revise_acceptance_command"):
                         continue
                     print(f"    [tool] {call.name}({_short(call.input)})")
                     try:
@@ -767,6 +801,60 @@ class Agent:
                     )
                     break  # fresh attempt, same as BudgetExceeded above -- attempts NOT incremented
 
+                if revise_call is not None:
+                    # Fixes the CHECK, not the code -- deliberately lighter
+                    # weight than discard_and_restart: no revert, no fresh
+                    # history, no attempt cost. Stays in the same attempt;
+                    # the model just keeps going against the corrected
+                    # command. Capped at 1/step, mechanically -- not a
+                    # judgment call about whether a given revision is
+                    # legitimate (see REVISE_ACCEPTANCE_COMMAND_TOOL's
+                    # description for why that judgment isn't the harness's
+                    # to make), just a bound on how far this can go unseen.
+                    if step_context.acceptance_command_revisions >= 1:
+                        tool_results.append(ToolResult(
+                            tool_call_id=revise_call.id, is_error=True,
+                            content=(
+                                "acceptance_command has already been revised once for this "
+                                "step -- that's the limit. Keep working against the current "
+                                "acceptance_command, or call discard_and_restart if the "
+                                "APPROACH needs to change, not the check."
+                            ),
+                        ))
+                    else:
+                        new_cmd = str(revise_call.input.get("new_acceptance_command", "")).strip()
+                        reason = str(revise_call.input.get("reason", ""))
+                        if not new_cmd:
+                            tool_results.append(ToolResult(
+                                tool_call_id=revise_call.id, is_error=True,
+                                content="new_acceptance_command must be non-empty",
+                            ))
+                        else:
+                            old_cmd = step_context.acceptance_command
+                            step_context.acceptance_command = new_cmd
+                            step_context.acceptance_command_revisions += 1
+                            print(f"    [revise] acceptance_command for '{step_context.title}': {reason[:200]}")
+                            self.session.log_event("acceptance_command_revised", {
+                                "title": step_context.title, "old_command": old_cmd,
+                                "new_command": new_cmd, "reason": reason,
+                            })
+                            baseline = self._run_baseline_check(step_context)
+                            step_context.baseline_check_result = baseline
+                            # Rebuild for the rest of THIS attempt so every
+                            # subsequent turn sees the corrected command and
+                            # its fresh baseline -- not just the tool result
+                            # below, which only the model's next turn reads.
+                            system = self._inner_system_prompt(state, step_context)
+                            tool_results.append(ToolResult(
+                                tool_call_id=revise_call.id,
+                                content=(
+                                    f"acceptance_command updated to:\n  {new_cmd}\n\n"
+                                    f"Baseline against the CURRENT workspace with this new "
+                                    f"command (same as what you saw at the start of this step, "
+                                    f"just re-run against the corrected command):\n{baseline}"
+                                ),
+                            ))
+
                 if mark_call is not None:
                     attempts += 1
                     repetition_guard.checkpoint()
@@ -804,6 +892,10 @@ class Agent:
                             stdout=result.stdout,
                             stderr=result.stderr,
                             exit_code=result.exit_code,
+                            original_acceptance_command=(
+                                step_context.original_acceptance_command
+                                if step_context.acceptance_command_revisions > 0 else None
+                            ),
                         ), ""
 
                     failure_detail = (
@@ -835,8 +927,14 @@ class Agent:
                         content=(
                             f"Acceptance check FAILED (attempt {attempts}/"
                             f"{self.config.budget.max_subtask_attempts}).\n"
-                            f"{failure_detail}\n"
-                            "Keep working, then call mark_step_done again."
+                            f"{failure_detail}\n\n"
+                            "Your edits for this attempt have been reverted -- the workspace "
+                            "is back to the last passing commit, not what you just wrote. "
+                            "Anything you confirmed working a moment ago (via read_file, "
+                            "run_command, a test run, etc.) no longer reflects the current "
+                            "files -- re-verify before relying on it, don't assume it's still "
+                            "there. Fix the actual underlying problem, then call "
+                            "mark_step_done again."
                         ),
                     ))
 
@@ -1062,6 +1160,11 @@ real progress, or you've realized your current approach fundamentally can't work
 call discard_and_restart instead of patching another guess on top of a tangled
 state. It reverts to the last passing commit and gives you a clean slate, at no
 cost to your attempt budget.
+If mark_step_done keeps failing and you have concrete evidence the ACCEPTANCE
+COMMAND itself is wrong (not your code) -- it references something that can't
+exist, depends on a program not available on this platform, checks the wrong
+path -- call revise_acceptance_command instead of continuing to grind against a
+check that can never pass. Usable once per step.
 """
 
     # ── summary ────────────────────────────────────────────────────────────
