@@ -27,6 +27,12 @@ class CompletedStep:
     stdout: str
     stderr: str
     exit_code: int
+    # Set only if revise_acceptance_command was used during this step --
+    # acceptance_command above always holds whatever command actually
+    # verified the step; this preserves what it started as, so a human
+    # reviewing session.json later can see a check moved, not just its
+    # final state.
+    original_acceptance_command: str | None = None
 
 
 @dataclass
@@ -50,6 +56,10 @@ class StepContext:
     # just the raw result, so the coder starts from the real baseline
     # instead of discovering it after several blind guesses.
     baseline_check_result: str = ""
+    # Set once, in the outer loop, right after baseline_check_result --
+    # before any revision can happen. See revise_acceptance_command.
+    original_acceptance_command: str = ""
+    acceptance_command_revisions: int = 0
 
     def prompt_text(self) -> str:
         files = "\n".join(f"  - {p}" for p in self.files) or "  (none specified -- locate as needed)"
@@ -76,6 +86,23 @@ class RunState:
     goal: str
     completed_steps: list[CompletedStep] = field(default_factory=list)
     scratchpad: str = ""  # model-writable working notes; not verified by the harness
+    # Harness-written, not model-written: one line appended automatically
+    # every time read_file/search_code actually returns something in the
+    # outer loop. Exists so file-reading progress is visible on disk
+    # (session.json) regardless of whether the model ever calls
+    # update_scratchpad -- it's a log, not a substitute for the model's own
+    # notes, so it's kept in its own field rather than mixed into scratchpad.
+    auto_read_log: str = ""
+    # Harness-condensed understanding, built automatically as files are
+    # read (see Agent._condense_batch). Keyed by filepath, NOT a single
+    # growing string -- confirmed bug in the string version: any single
+    # condensation pass could (and did) silently overwrite the ENTIRE
+    # field, discarding every prior file's coverage the moment a later
+    # pass didn't happen to re-mention it. A dict makes that structurally
+    # impossible: a pass covering files [a, b] can only ever write keys
+    # 'a' and 'b', regardless of what it returns -- every other file's
+    # entry is untouched no matter what.
+    condensed_files: dict[str, str] = field(default_factory=dict)
     status: Literal["running", "done", "aborted"] = "running"
 
     # ---- serialisation (for resumable sessions) ----
@@ -85,6 +112,8 @@ class RunState:
             "goal": self.goal,
             "completed_steps": [asdict(s) for s in self.completed_steps],
             "scratchpad": self.scratchpad,
+            "auto_read_log": self.auto_read_log,
+            "condensed_files": self.condensed_files,
             "status": self.status,
         }
 
@@ -94,6 +123,8 @@ class RunState:
             goal=d["goal"],
             completed_steps=[CompletedStep(**s) for s in d.get("completed_steps", [])],
             scratchpad=d.get("scratchpad", ""),
+            auto_read_log=d.get("auto_read_log", ""),
+            condensed_files=d.get("condensed_files", {}),
             status=d.get("status", "running"),
         )
 

@@ -21,6 +21,38 @@ from .config import ApprovalPolicy, ALWAYS_CONFIRM_SUBSTRINGS, SAFE_COMMAND_PREF
 # command first, so this can't be used to sneak a dangerous command past it.
 _CD_SEGMENT_RE = re.compile(r"^cd(?:\s+/d)?\s+\S+$", re.IGNORECASE)
 
+# Best-effort, deliberately narrow signals that a command's ARGUMENTS (not
+# just its verb) reach outside the workspace: literal ".." path traversal,
+# a Windows drive-letter absolute path, or a "~" home-dir reference. This is
+# a text pattern match on an arbitrary shell/script string, not a real
+# parser -- it can't catch every way to reach outside the workspace (e.g.
+# an indirect path built up across several commands, or one hidden inside
+# an env var), and it deliberately does NOT flag a bare leading "/" as an
+# absolute-path signal, since that's also how Windows commands write flags
+# (`dir /s`, `xcopy /e`) -- flagging it would block ordinary in-workspace
+# exploration on the exact platform this tool mainly targets. It exists to
+# catch the common, non-adversarial case (a model wandering with `cd ..` or
+# an absolute path), not to withstand something actively trying to escape.
+_DOTDOT_TRAVERSAL_RE = re.compile(r"(?:^|[\s\"'=(])\.\.(?:[\\/]|$|[\s\"')])")
+_WINDOWS_DRIVE_ABS_RE = re.compile(r"[A-Za-z]:[\\/]")
+_HOME_DIR_RE = re.compile(r"(?:^|\s)~(?:[\\/]|$)")
+
+
+def detect_workspace_escape(command: str) -> str | None:
+    """Returns a short reason if `command` looks like it reaches outside
+    the workspace root, or None. Independent of ApprovalPolicy.mode --
+    callers that want this to force confirmation even under "auto" do so
+    by checking this separately from classify_command, not by routing it
+    through classify_command's mode-aware logic."""
+    if _DOTDOT_TRAVERSAL_RE.search(command):
+        return "contains a '..' path traversal segment"
+    if _WINDOWS_DRIVE_ABS_RE.search(command):
+        return "contains a Windows drive-letter absolute path"
+    if _HOME_DIR_RE.search(command):
+        return "contains a '~' home-directory reference"
+    return None
+
+
 # Two-character operators must be checked before their single-character
 # component (e.g. "&&" before "&", "||" before "|") so a compound operator
 # isn't split in the middle.
@@ -28,7 +60,7 @@ _TWO_CHAR_OPERATORS = ("&&", "||")
 _ONE_CHAR_OPERATORS = (";", "|")
 
 
-def _split_command_segments(command: str) -> list[str] | None:
+def split_command_segments(command: str) -> list[str] | None:
     """Split a shell command into its individual pipeline/chain segments on
     &&, ||, ;, and | -- but not when those characters appear inside a
     quoted string, so e.g. a semicolon embedded in a `python -c "..."`
@@ -90,7 +122,7 @@ def classify_command(command: str, policy: ApprovalPolicy) -> ApprovalDecision:
         if bad in lowered:
             return ApprovalDecision(True, f"command contains '{bad.strip()}' (always confirmed)")
 
-    segments = _split_command_segments(command)
+    segments = split_command_segments(command)
     if segments is None:
         return ApprovalDecision(True, "command has unbalanced quotes and could not be safely classified")
     if not segments:
@@ -124,7 +156,17 @@ def confirm_with_human(prompt: str) -> bool:
     print("APPROVAL REQUIRED")
     print(prompt)
     print("=" * 60)
-    answer = input("Proceed? [y/N]: ").strip().lower()
+    try:
+        answer = input("Proceed? [y/N]: ").strip().lower()
+    except EOFError:
+        # No one's there to answer -- e.g. an unattended run with no TTY on
+        # stdin. Silently hanging (it won't -- input() raises immediately)
+        # isn't the risk; an uncaught EOFError propagating up and crashing
+        # the whole harness mid-run is. Default to the same safe outcome a
+        # human declining would produce: deny, and say why, so the model
+        # gets an explanatory tool result instead of the run dying.
+        print("[no input available -- treating as denied]")
+        return False
     return answer in ("y", "yes")
 
 
@@ -135,4 +177,17 @@ def ask_human_question(question: str) -> str:
     print("THE AGENT IS ASKING FOR CLARIFICATION:")
     print(question)
     print("-" * 60)
-    return input("Your answer: ").strip()
+    try:
+        return input("Your answer: ").strip()
+    except EOFError:
+        # Same unattended-run risk as confirm_with_human above: no TTY on
+        # stdin means input() raises immediately rather than blocking, and
+        # left uncaught that crashes the whole run over a question nobody
+        # was there to answer. Tell the model plainly rather than crashing
+        # or returning an empty string it might mistake for a real answer.
+        print("[no input available -- no one was there to answer]")
+        return ("(no human was available to answer this -- no one is monitoring this "
+                "run right now. Use your own best judgement and proceed, or if you "
+                "genuinely cannot proceed without this answer, treat the goal as "
+                "blocked and explain why in declare_done or an escalation.)")
+

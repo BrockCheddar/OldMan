@@ -23,6 +23,7 @@ Every LLM call is synchronous. Exactly one request is in flight at a time.
 from __future__ import annotations
 
 import ast
+import os
 import re
 import sys
 
@@ -36,12 +37,127 @@ from .planner import RunState, CompletedStep, StepContext
 from .repetition import RepetitionGuard
 from .session import SessionStore
 from .state_report import compact_history_with_state_report
-from .tools import ToolBox, ToolError, TOOL_SCHEMAS
+from .tools import ToolBox, ToolError, TOOL_SCHEMAS, validate_command_for_os, looks_like_mutating_command
 from .workspace import Workspace
 
 
 class AgentAborted(RuntimeError):
     pass
+
+
+# ── outer-loop exploration carry-over (bounded, so it can't itself blow the budget) ──
+
+_EXPLORATION_LOG_MAX_ENTRIES = 8
+_EXPLORATION_ENTRY_CHAR_CAP = 1500
+_EXPLORATION_TOTAL_CHAR_CAP = 9000
+
+# Total chars the "files in scope" block of a state report may spend on
+# live file content, and the floor given to any single file even when
+# there are many files in scope. Replaces a hard `files[:5]` cap that
+# dropped files 6+ silently.
+_FILES_IN_SCOPE_CHAR_BUDGET = 15000
+_FILES_IN_SCOPE_MIN_PER_FILE = 800
+
+# condensed_files storage: cap per-file, not on the whole structure --
+# with a dict, total size naturally scales with file count instead of one
+# shared budget that any single pass could blow through or empty out.
+_CONDENSED_FILE_ENTRY_CHAR_CAP = 1500
+# condensed_files DISPLAY: separate cap for how much of the dict gets
+# rendered into any one prompt (condensation call, state report, or
+# per-turn context). Storage can hold the whole codebase's worth of
+# entries; a single render must still fit in context regardless of repo
+# size -- this is the same risk flagged earlier for the old single-string
+# field, now guarded explicitly rather than left implicit.
+_CONDENSED_FILES_RENDER_CHAR_CAP = 12000
+
+
+def _parse_condensed_sections(text: str) -> dict[str, str]:
+    """Parses the condensation call's `### <path>` per-file format back into
+    a dict. Tolerant of minor formatting drift (extra blank lines, trailing
+    whitespace) since this is a small local model's output, not a strict
+    machine format -- but the delimiter itself (### at line start) is
+    exact, so a malformed response yields an empty or partial dict rather
+    than a mis-split mess."""
+    sections: dict[str, str] = {}
+    current_path: str | None = None
+    current_lines: list[str] = []
+    for line in text.splitlines():
+        if line.startswith("### "):
+            if current_path is not None:
+                sections[current_path] = "\n".join(current_lines).strip()
+            current_path = line[4:].strip()
+            current_lines = []
+        elif current_path is not None:
+            current_lines.append(line)
+    if current_path is not None:
+        sections[current_path] = "\n".join(current_lines).strip()
+    return {path: note for path, note in sections.items() if note}
+
+
+def _render_exploration_log(exploration_log: list[tuple[str, str]] | None) -> str:
+    """Most-recent-first, each entry capped, total output capped. Returns ''
+    if there's nothing to show."""
+    if not exploration_log:
+        return ""
+    recent = exploration_log[-_EXPLORATION_LOG_MAX_ENTRIES:]
+    blocks = []
+    total = 0
+    for label, content in reversed(recent):
+        snippet = content[:_EXPLORATION_ENTRY_CHAR_CAP]
+        block = f"--- {label} ---\n{snippet}"
+        if total + len(block) > _EXPLORATION_TOTAL_CHAR_CAP:
+            break
+        blocks.append(block)
+        total += len(block)
+    return "\n\n".join(blocks)
+
+
+def _render_condensed_files(condensed_files: dict[str, str] | None,
+                             char_cap: int = _CONDENSED_FILES_RENDER_CHAR_CAP) -> str:
+    """Renders the per-file condensed-understanding dict into one block for
+    display/prompting. Bounded regardless of how many files the dict holds
+    -- a 300-file repo's full dict must never be dumped unbounded into a
+    single prompt (that's exactly the context-overflow risk flagged
+    earlier in this project, now guarded explicitly). Stops adding entries
+    once the cap is hit and says so, rather than silently truncating mid-
+    entry or dropping entries with no signal."""
+    if not condensed_files:
+        return ""
+    blocks = []
+    total = 0
+    omitted = 0
+    for path, note in condensed_files.items():
+        block = f"### {path}\n{note}"
+        if total + len(block) > char_cap:
+            omitted += 1
+            continue
+        blocks.append(block)
+        total += len(block)
+    rendered = "\n\n".join(blocks)
+    if omitted:
+        rendered += f"\n\n[{omitted} more file(s) condensed but omitted here -- over the display budget]"
+    return rendered
+
+
+def _merge_exploration_into_findings(findings: str, exploration_log: list[tuple[str, str]] | None,
+                                      condensed_files: dict[str, str] | None = None) -> str:
+    """
+    propose_step's `findings` field is whatever the model chose to type in
+    -- if it forgot to copy something over, the coder's fresh context never
+    sees it. This appends two safety nets underneath the model's own
+    (usually better curated) summary: the harness-condensed per-file
+    understanding first (denser, covers everything read so far, not just
+    the current span), then raw exploration output as a last resort for
+    whatever hasn't been condensed yet.
+    """
+    parts = [findings] if findings else []
+    condensed_block = _render_condensed_files(condensed_files)
+    if condensed_block:
+        parts.append("[Auto-attached: harness-condensed per-file understanding built while reading]\n" + condensed_block)
+    exploration_block = _render_exploration_log(exploration_log)
+    if exploration_block:
+        parts.append("[Auto-attached: raw exploration output not yet condensed]\n" + exploration_block)
+    return "\n\n".join(parts)
 
 
 # ── additional tools for the incremental loop ─────────────────────────────
@@ -277,6 +393,121 @@ class Agent:
             text = "...[older scratchpad content trimmed]...\n" + text[-self.MAX_SCRATCHPAD_CHARS:]
         state.scratchpad = text
 
+    MAX_AUTO_READ_LOG_CHARS = 4000
+
+    def _append_auto_read_note(self, state: "RunState", tool_name: str, target: str, output: str) -> None:
+        """Harness-side, not model-side: fires on every real read_file/
+        search_code result in the outer loop regardless of whether the
+        model ever calls update_scratchpad. Purely observational -- one
+        short line per read, never fed back into the model's own prompt,
+        so it costs zero extra prompt tokens. Saved to disk immediately so
+        `session.json` reflects reading progress in near-real time instead
+        of only updating at step/compaction boundaries."""
+        first_line = output.splitlines()[0] if output.strip() else "(empty)"
+        note = f"[{tool_name}] {target} -> {first_line}"[:300]
+        combined = f"{state.auto_read_log}\n{note}" if state.auto_read_log else note
+        if len(combined) > self.MAX_AUTO_READ_LOG_CHARS:
+            combined = "...[earlier reads trimmed]...\n" + combined[-self.MAX_AUTO_READ_LOG_CHARS:]
+        state.auto_read_log = combined
+        self.session.save_state(state)
+
+    def _condense_batch(self, state: "RunState", touched_files: set[str],
+                         exploration_log: list[tuple[str, str]]) -> None:
+        """
+        Harness-triggered, not model-triggered: fires automatically once
+        `condense_batch_size` distinct files have been read, regardless of
+        whether the model ever calls update_scratchpad. This is the fix
+        for "read many files, understanding evaporates."
+
+        Per-file dict, not a single growing string -- confirmed bug in the
+        string version: `state.condensed_notes = text` let ANY single pass
+        silently overwrite the entire field, discarding every prior file's
+        coverage the moment a later pass's response didn't happen to
+        re-mention it (observed directly: agent.py was condensed 7 times
+        across a real run, then vanished from the final saved notes because
+        the last pass's batch didn't include it). Here, a pass can only
+        write keys for the files actually in `touched_files` -- structurally
+        incapable of touching any other file's entry, no matter what the
+        model returns.
+
+        The full existing dict is still shown as READ-ONLY context (so the
+        model can correctly describe cross-file relationships -- e.g. file A
+        calling into a class defined in file B -- even though this pass only
+        writes A's entry), bounded by _render_condensed_files so a large
+        repo's full dict can't itself overflow this call's own prompt.
+        """
+        batch_content = _render_exploration_log(
+            [(label, content) for label, content in exploration_log
+             if any(path in label for path in touched_files)]
+        )
+        if not batch_content:
+            return
+        file_list = ", ".join(sorted(touched_files))
+        system = (
+            "You are building per-file notes on a codebase being explored file by "
+            "file. You will be given (a) existing notes on OTHER files already "
+            "covered, as read-only reference context, and (b) raw content just "
+            "read from a NEW batch of files. Describe ONLY the new batch's files -- "
+            "what each one's purpose is, key classes/functions, and how it connects "
+            "to anything in the reference context. Be concrete and specific, not "
+            "generic. Output ONE section per new-batch file, in exactly this "
+            "format, nothing else:\n"
+            "### <exact file path>\n<description>\n\n"
+            f"The new batch contains exactly these files -- output a section for "
+            f"each one and nothing else: {file_list}"
+        )
+        existing_context = _render_condensed_files(state.condensed_files)
+        user_text = (
+            f"Existing notes on other files (read-only reference):\n"
+            f"{existing_context or '(nothing condensed yet -- this is the first batch)'}\n\n"
+            f"New batch to describe:\n{batch_content}\n\n"
+            "Write the per-file sections now."
+        )
+        try:
+            # Call the backend directly, not self._call_llm -- that wrapper
+            # escalates backend failures to an interactive human prompt,
+            # which is correct for the main loop but wrong here: this is a
+            # best-effort auxiliary pass, and a timeout on it should never
+            # stop the run or demand a human answer. Worst case, this batch
+            # doesn't get condensed and exploration_log/auto_read_log still
+            # hold the raw record.
+            response = self.llm.complete(
+                system=system, history=[Turn(role="user", text=user_text)], tools=[],
+                max_tokens=self.config.budget.max_output_tokens,
+            )
+            self.budget.record_usage(response.input_tokens, response.output_tokens)
+        except LLMError as e:
+            self.session.log_event("condensation_pass_failed", {"error": str(e)})
+            return
+        if not response.text:
+            return
+        parsed = _parse_condensed_sections(response.text)
+        # Write-scoping enforced here, not just requested in the prompt:
+        # only apply entries whose path was actually in this batch. A
+        # model ignoring the instruction and describing (or re-describing)
+        # some other file cannot touch that file's real entry through this
+        # path -- the dict key space outside `touched_files` is simply
+        # never written to, regardless of what comes back.
+        applied = 0
+        for path, note in parsed.items():
+            if path not in touched_files:
+                continue
+            if len(note) > _CONDENSED_FILE_ENTRY_CHAR_CAP:
+                note = note[:_CONDENSED_FILE_ENTRY_CHAR_CAP]
+            state.condensed_files[path] = note
+            applied += 1
+        if applied == 0:
+            # Model didn't follow the format closely enough to parse --
+            # log it, but don't guess; existing entries (if any) for these
+            # files are left exactly as they were rather than risking a
+            # bad partial write.
+            self.session.log_event("condensation_parse_failed", {"files": sorted(touched_files)})
+            return
+        self.session.log_event("condensation_pass", {"files": sorted(touched_files), "applied": applied})
+        self.session.save_state(state)
+        self.session.log_event("condensation_pass", {"files": sorted(touched_files)})
+        self.session.save_state(state)
+
     def _call_llm(self, state: RunState, system: str, history: list[Turn], tools: list[dict]):
         """
         Wraps self.llm.complete(). A backend failure/timeout (LLMError) no
@@ -331,13 +562,22 @@ class Agent:
 
     # ── outer loop: choose next step ───────────────────────────────────────
 
-    def _build_outer_state_report(self, state: RunState) -> str:
+    def _build_outer_state_report(self, state: RunState,
+                                   exploration_log: list[tuple[str, str]] | None = None) -> str:
         """
         Same idea as _build_state_report, applied at the run level instead
         of the step level. Built entirely from live checks against the
         real workspace and the RunState's own current fields -- never from
         old chat text -- so it can never be stale, unlike a truncated
         fragment of old tool output.
+
+        exploration_log carries what read_file/search_code actually
+        returned this span, independent of the chat history being
+        compacted away. Without it, compaction used to wipe every file the
+        model had read down to a bare filename in the directory listing --
+        the model would "forget" file contents it had just seen the moment
+        history grew too large. Bounded per-entry and in total so this
+        can't itself become the next context blowout.
         """
         lines = [
             "STATE REPORT (outer loop)",
@@ -347,8 +587,13 @@ class Agent:
             "",
             f"Scratchpad:\n{state.scratchpad or '(empty)'}",
             "",
-            "Current workspace files (live listing, not memory):",
         ]
+        if state.condensed_files:
+            lines.append(f"Harness-condensed per-file understanding built while reading so far "
+                         f"(check this before reading more -- if it already covers what you "
+                         f"need, propose_step or declare_done instead):\n{_render_condensed_files(state.condensed_files)}")
+            lines.append("")
+        lines.append("Current workspace files (live listing, not memory):")
         try:
             listing = self.toolbox.dispatch("list_dir", {"path": "."})
         except ToolError as e:
@@ -358,12 +603,93 @@ class Agent:
         git_status = self.workspace.git_status()
         lines.append(f"\nGit status (uncommitted changes, live check):\n{git_status.stdout[:800] or '(clean)'}")
 
+        exploration_block = _render_exploration_log(exploration_log)
+        if exploration_block:
+            lines.append(f"\nWhat you've already read this session (from real tool output, "
+                          f"most recent first):\n{exploration_block}")
+
         return "\n".join(lines)
+
+    def _flush_dirty_condensed(self, state: "RunState", dirty_files: set[str]) -> None:
+        """Refreshes condensed_files entries for paths edited (write_file/
+        edit_file) since the last flush, right after mark_step_done commits.
+
+        Fixes a real gap in the read-triggered condensation above: that
+        mechanism only ever re-condenses a file when the model re-reads it,
+        but write_file/edit_file don't touch files_since_condense at all --
+        so an edited file's entry can keep describing pre-edit content
+        indefinitely, with nothing to correct it, since there's no
+        model-facing tool to hand-edit one entry (deliberately -- that
+        would reopen the single-point-of-overwrite bug the dict design
+        exists to prevent). Runs post-commit rather than per-edit so a step
+        with several edit_file calls in a row against the same file only
+        pays for one condensation pass, and never against edits later
+        reverted by a failed acceptance check.
+
+        Reads each file fresh off disk rather than relying on the read/
+        exploration log -- an edited-but-never-re-read file has no log
+        entry to reuse, and a fresh read is also correct for a file that
+        WAS re-read earlier in the step but edited again afterward.
+        """
+        synthetic_log: list[tuple[str, str]] = []
+        touched: set[str] = set()
+        for path in dirty_files:
+            try:
+                content = self.toolbox.dispatch("read_file", {"path": path})
+            except ToolError:
+                # Deleted (or moved) since being edited -- nothing to
+                # condense; drop any existing entry rather than let it
+                # describe a file that no longer exists.
+                state.condensed_files.pop(path, None)
+                continue
+            synthetic_log.append((f"read_file({path})", content))
+            touched.add(path)
+        if touched:
+            self._condense_batch(state, touched, synthetic_log)
+
+    # Real per-repo file-reading workload isn't knowable in advance, so
+    # thresholds tuned for a 25-file run either nudge/condense too
+    # aggressively on a huge repo or barely fire at all -- this counts
+    # actual files in the workspace once, at run start, so downstream
+    # thresholds scale with the real target instead of a hand-picked
+    # constant. Deliberately cheap (os.walk, not a model turn) and
+    # deliberately excludes dirs no one is going to read.
+    _SCALE_EXCLUDED_DIRS = {".git", ".autocoder", "node_modules", "__pycache__",
+                            ".venv", "venv", ".pytest_cache", "dist", "build"}
+
+    def _count_workspace_files(self) -> int:
+        count = 0
+        for root, dirs, files in os.walk(self.workspace.root):
+            dirs[:] = [d for d in dirs if d not in self._SCALE_EXCLUDED_DIRS and not d.startswith(".")]
+            count += len(files)
+        return count
+
+    # Distinct files per condensation batch = file_count // this, floored
+    # at the minimum. ~1/6th of the repo per batch keeps a 25-file repo at
+    # a batch of ~5 and a 300-file repo at a batch of 50 -- proportional
+    # cadence rather than a flat count that's wrong at either extreme.
+    _CONDENSE_DIVISOR = 6
+    _CONDENSE_BATCH_MIN = 4
+
+    def _condensation_batch_size(self) -> int:
+        file_count = self._count_workspace_files()
+        return max(self._CONDENSE_BATCH_MIN, file_count // self._CONDENSE_DIVISOR)
 
     def _outer_loop(self, state: RunState, final_acceptance_command: str | None) -> None:
         history: list[Turn] = []
         self.budget.new_outer_span()
         repetition_guard = RepetitionGuard()
+        # Running record of what read_file/search_code actually returned
+        # this outer-loop span, independent of chat history. Chat history
+        # gets trimmed/compacted for token budget; this does not, so a
+        # propose_step handoff or a state-report compaction can still draw
+        # on everything read so far instead of only what's left in `history`.
+        exploration_log: list[tuple[str, str]] = []
+        # Distinct files (not raw read calls, so paginating one big file
+        # via offset/limit never counts as "many files") touched since the
+        # last condensation pass.
+        files_since_condense: set[str] = set()
+        condense_batch_size = self._condensation_batch_size()
 
         while state.status == "running":
             # Reset for record_decision's originating_step -- _inner_loop
@@ -383,9 +709,22 @@ class Agent:
                 continue
 
             system = self._outer_system_prompt(state)
+            # condensed_notes was previously only shown at the propose_step
+            # handoff and inside the inner loop -- meaning the model could
+            # be sitting on a harness-built, near-complete understanding of
+            # the codebase while still in the outer loop with zero
+            # visibility into it, having no evidence it had already covered
+            # enough to act. Included here, every turn, same treatment as
+            # scratchpad, so it can actually inform the next decision
+            # instead of only appearing after the model has already
+            # committed to propose_step.
             context_msg = (
                 f"COMPLETED STEPS SO FAR:\n{state.completed_summary_text()}\n\n"
                 f"SCRATCHPAD:\n{state.scratchpad or '(empty)'}\n\n"
+                f"HARNESS-CONDENSED UNDERSTANDING, per file (built automatically as you read "
+                f"files -- check this before deciding to read more; if it already covers what "
+                f"you need, propose_step or declare_done instead of re-reading):\n"
+                f"{_render_condensed_files(state.condensed_files) or '(nothing condensed yet)'}\n\n"
                 "What is your next action?"
             )
             history.append(Turn(role="user", text=context_msg))
@@ -402,7 +741,7 @@ class Agent:
                     "or a workspace tool if you need to explore first."
                 )))
                 if self._prompt_over_budget(system, history, OUTER_TOOLS):
-                    report = self._build_outer_state_report(state)
+                    report = self._build_outer_state_report(state, exploration_log)
                     history = compact_history_with_state_report(history, report)
                     self.session.log_event("state_report_compaction", {"scope": "outer"})
                 continue
@@ -465,25 +804,34 @@ class Agent:
                     if isinstance(relevant_regions, str):
                         relevant_regions = [relevant_regions]
                     if not acceptance_cmd:
+                        self.session.log_event("propose_step_rejected", {
+                            "title": title, "reason": "missing acceptance_command",
+                        })
                         tool_results.append(ToolResult(
                             tool_call_id=call.id, is_error=True,
                             content="acceptance_command is required and must be non-empty.",
                         ))
                         acted = True
                         continue
-                    syntax_problem = _validate_python_dash_c_syntax(acceptance_cmd)
-                    if syntax_problem:
+                    validation_problem = _validate_acceptance_command(acceptance_cmd)
+                    if validation_problem:
+                        self.session.log_event("propose_step_rejected", {
+                            "title": title, "reason": validation_problem,
+                            "acceptance_command": acceptance_cmd,
+                        })
                         tool_results.append(ToolResult(
                             tool_call_id=call.id, is_error=True,
                             content=(
                                 f"acceptance_command is invalid and would fail every time, "
-                                f"regardless of what you implement: {syntax_problem}\n"
+                                f"regardless of what you implement: {validation_problem}\n"
                                 f"Command was: {acceptance_cmd}\n"
                                 "Call propose_step again with a corrected, valid acceptance_command."
                             ),
                         ))
                         acted = True
                         continue
+                    self.session.log_event("propose_step_accepted", {"title": title})
+                    findings = _merge_exploration_into_findings(findings, exploration_log, state.condensed_files)
                     step_context = StepContext(
                         title=title,
                         objective=objective,
@@ -510,6 +858,8 @@ class Agent:
                         # human gave guidance (not abort) -- start fresh with
                         # it in the scratchpad rather than ending the run
                         history = []
+                        exploration_log = []
+                        files_since_condense = set()
                         history_reset = True
                         acted = True
                         break
@@ -521,6 +871,8 @@ class Agent:
                     # reset outer history after each completed step so context
                     # stays bounded and old tool output doesn't pile up
                     history = []
+                    exploration_log = []
+                    files_since_condense = set()
                     history_reset = True
                     self.budget.new_outer_span()  # real progress -- grant a fresh outer budget
                     acted = True
@@ -534,22 +886,76 @@ class Agent:
                     continue
 
                 # workspace tool
-                if call.name not in _OUTER_SAFE_TOOL_NAMES:
+                mutation_reason = None
+                if call.name == "run_command":
+                    mutation_reason = looks_like_mutating_command(call.input.get("command", "") or "")
+                if call.name not in _OUTER_SAFE_TOOL_NAMES or mutation_reason:
                     # Not offered at this level -- reject explicitly rather
                     # than silently dispatching it if the model emits it
                     # anyway (local models don't always strictly respect the
                     # offered tool list). write_file/edit_file specifically
                     # must never mutate a file outside the verified
-                    # propose_step -> inner-loop path.
-                    tool_results.append(ToolResult(
-                        tool_call_id=call.id, is_error=True,
-                        content=(
+                    # propose_step -> inner-loop path (see _OUTER_SAFE_TOOL_NAMES
+                    # comment for why -- an unverified outer-loop write once
+                    # silently clobbered an already-checked file). run_command
+                    # IS offered here (it's needed for read-only investigation:
+                    # listing, compiling, running tests) but gets the same
+                    # treatment when it looks like it would mutate something --
+                    # otherwise it's a second, ungated path to the exact thing
+                    # write_file is blocked from doing (confirmed in practice:
+                    # a run stuck here used run_command to create and repeatedly
+                    # overwrite a file rather than ever calling propose_step).
+                    # What we CAN safely do is stop a small local model from
+                    # thrashing on the same rejection: track it through the
+                    # same repetition guard real tool calls use, and on repeat
+                    # give it the exact propose_step call to make instead of
+                    # just repeating the same "no" a fourth time.
+                    if mutation_reason:
+                        blocked_reason = (
+                            f"run_command rejected: it {mutation_reason}. The outer loop is "
+                            "read-only exploration only -- run_command here may inspect the "
+                            "workspace (list, read, compile-check, run tests) but never "
+                            "create, modify, delete, or install anything. Call propose_step "
+                            "to make an actual change, including creating any deliverable "
+                            "file (a summary, a report, anything with real content); it "
+                            "hands off to a step where your work gets verified."
+                        )
+                    else:
+                        blocked_reason = (
                             f"'{call.name}' is not available here -- this is the outer loop, "
                             "read-only exploration only. Call propose_step to make an actual "
                             "change; it hands off to a step where your work gets verified."
-                        ),
+                        )
+                    warning = repetition_guard.record(call.name, call.input)
+                    if warning and call.name in ("write_file", "edit_file"):
+                        target = call.input.get("path", "the file")
+                        blocked_reason += (
+                            f"\n\nYou've tried this more than once -- call propose_step now with "
+                            f"files=[\"{target}\"] and an objective describing the change you were "
+                            "about to make; you'll get write_file back inside that step."
+                        )
+                        if repetition_guard.should_force_escalate():
+                            force_escalate_reason = (
+                                f"stuck repeating blocked {call.name} on the same target from the "
+                                "outer loop instead of calling propose_step"
+                            )
+                    elif warning and mutation_reason:
+                        blocked_reason += (
+                            "\n\nYou've tried this more than once -- call propose_step now "
+                            "describing what you're trying to create or change; you'll get "
+                            "an unrestricted run_command (and write_file) back inside that step."
+                        )
+                        if repetition_guard.should_force_escalate():
+                            force_escalate_reason = (
+                                "stuck repeating a blocked mutating run_command from the outer "
+                                "loop instead of calling propose_step"
+                            )
+                    tool_results.append(ToolResult(
+                        tool_call_id=call.id, is_error=True, content=blocked_reason,
                     ))
                     acted = True
+                    if force_escalate_reason:
+                        break
                     continue
                 print(f"  [tool] {call.name}({_short(call.input)})")
                 try:
@@ -565,9 +971,34 @@ class Agent:
                                 "were already given and ignored"
                             )
                     tool_results.append(ToolResult(tool_call_id=call.id, content=output))
+                    if call.name in ("read_file", "search_code"):
+                        target = call.input.get("path") or call.input.get("query") or ""
+                        exploration_log.append((f"{call.name}({target})", output))
+                        self._append_auto_read_note(state, call.name, target, output)
+                        if call.name == "read_file" and target:
+                            files_since_condense.add(target)
+                            if len(files_since_condense) >= condense_batch_size:
+                                self._condense_batch(state, files_since_condense, exploration_log)
+                                files_since_condense = set()
                 except ToolError as e:
                     print(f"    -> ERROR: {e}")
-                    tool_results.append(ToolResult(tool_call_id=call.id, content=f"ERROR: {e}", is_error=True))
+                    error_msg = str(e)
+                    # validate_command_for_os's rejection for multi-line/heredoc
+                    # commands tells the model to use write_file to stage the
+                    # content instead -- correct advice inside a step, but
+                    # write_file isn't offered here (see the _OUTER_SAFE_TOOL_NAMES
+                    # rejection above). Left uncorrected, this is a dead end:
+                    # the model is pointed at a tool it doesn't have, with no
+                    # indication that propose_step is the way to get it.
+                    if call.name == "run_command" and "write_file" in error_msg:
+                        error_msg += (
+                            "\n\nNote: write_file isn't available in this outer loop. "
+                            "Call propose_step first (with a valid acceptance_command) -- "
+                            "you'll get write_file back inside that step to create the "
+                            "content properly, in one call, instead of building it "
+                            "through single-line shell commands."
+                        )
+                    tool_results.append(ToolResult(tool_call_id=call.id, content=f"ERROR: {error_msg}", is_error=True))
                 self.session.log_event("tool_call", {"name": call.name})
                 acted = True
                 if force_escalate_reason:
@@ -576,7 +1007,7 @@ class Agent:
             if tool_results and not history_reset:
                 history.append(Turn(role="tool_results", tool_results=tool_results))
                 if self._prompt_over_budget(system, history, OUTER_TOOLS):
-                    report = self._build_outer_state_report(state)
+                    report = self._build_outer_state_report(state, exploration_log)
                     history = compact_history_with_state_report(history, report)
                     self.session.log_event("state_report_compaction", {"scope": "outer"})
 
@@ -585,6 +1016,7 @@ class Agent:
                 if state.status != "running":
                     return
                 history = []
+                exploration_log = []
                 repetition_guard.checkpoint()
                 continue
 
@@ -593,7 +1025,7 @@ class Agent:
         return self.llm.count_tokens(system, history, tools) > budget_tokens
 
     def _build_state_report(self, step_context: StepContext, attempt: int, max_attempts: int,
-                             last_check_summary: str = "") -> str:
+                             last_check_summary: str = "", condensed_files: dict[str, str] | None = None) -> str:
         """
         Builds a compact 'you are HERE NOW' block from the real, current
         workspace state -- a live file listing, live content of the files
@@ -615,15 +1047,33 @@ class Agent:
         except ToolError as e:
             listing = f"(could not list workspace: {e})"
         lines.append(listing[:1500])
+        condensed_block = _render_condensed_files(condensed_files)
+        if condensed_block:
+            lines.append(f"\nHarness-condensed per-file understanding built while reading so far:\n{condensed_block}")
 
         if step_context.files:
+            # Budget by total characters, not a fixed file count -- a fixed
+            # `files[:5]` slice silently dropped files 6+ from a larger
+            # scope with no signal to the model that anything was cut.
+            # Each file still gets a floor so a big early file can't starve
+            # every later one down to nothing.
+            budget = _FILES_IN_SCOPE_CHAR_BUDGET
+            per_file_cap = max(budget // max(len(step_context.files), 1), _FILES_IN_SCOPE_MIN_PER_FILE)
             lines.append("\nCurrent content of files in scope (live read, not memory):")
-            for path in step_context.files[:5]:
+            shown = 0
+            for path in step_context.files:
+                if shown >= budget:
+                    remaining = len(step_context.files) - step_context.files.index(path)
+                    lines.append(f"\n[{remaining} more file(s) in scope omitted -- over the state-report "
+                                 f"character budget; read them directly with read_file if needed]")
+                    break
                 try:
                     content = self.toolbox.dispatch("read_file", {"path": path, "limit": 200})
                 except ToolError as e:
                     content = f"(could not read {path}: {e})"
-                lines.append(f"\n--- {path} ---\n{content[:3000]}")
+                block = f"\n--- {path} ---\n{content[:per_file_cap]}"
+                lines.append(block)
+                shown += len(block)
 
         git_status = self.workspace.git_status()
         lines.append(f"\nGit status (uncommitted changes, live check):\n{git_status.stdout[:800] or '(clean)'}")
@@ -696,6 +1146,27 @@ class Agent:
         # record_decision's originating_step label for the duration of this
         # step; _outer_loop resets it back to the default on its next turn.
         self.toolbox.current_context = f"step: {step_context.title}"
+        # Same condensation mechanism as the outer loop (Agent._condense_batch),
+        # extended here because a model can do all its "understanding
+        # building" reading inside a step instead of during outer-loop
+        # exploration -- confirmed happening in practice: propose_step was
+        # called after only 2 list_dir calls, then dozens of read_file
+        # calls happened here with none of the outer loop's memory safety
+        # nets in effect. Persists across attempts within this step
+        # (failed attempts don't erase understanding already built).
+        inner_exploration_log: list[tuple[str, str]] = []
+        inner_files_since_condense: set[str] = set()
+        condense_batch_size = self._condensation_batch_size()
+        # Paths written/edited since the last successful mark_step_done.
+        # Deliberately NOT condensed on every write (see _condense_batch's
+        # dict design -- that guards against overwrite, this is a separate
+        # problem: a condensed_files entry describing pre-edit content once
+        # the model has since changed that file). Reset on a genuine fresh
+        # attempt (below) since a revert wipes whatever it would describe;
+        # left alone across a failed-but-continuing mark_step_done because
+        # the eventual flush always re-reads the file fresh off disk, so an
+        # over-inclusive set only costs an extra read, never a wrong note.
+        dirty_files: set[str] = set()
 
         while attempts < self.config.budget.max_subtask_attempts:
             self.budget.new_attempt()
@@ -707,6 +1178,7 @@ class Agent:
             # "passing" commit. A no-op on the first attempt (nothing to
             # revert yet).
             self.workspace.git_revert_to_last_commit()
+            dirty_files = set()
             system = self._inner_system_prompt(state, step_context)
             # Fresh coder context every attempt. The planner conversation is
             # deliberately NOT carried across this boundary. Only the compact
@@ -747,6 +1219,7 @@ class Agent:
                         report = self._build_state_report(
                             step_context, attempts + 1,
                             self.config.budget.max_subtask_attempts, last_check_summary,
+                            state.condensed_files,
                         )
                         history = compact_history_with_state_report(history, report)
                         self.session.log_event("state_report_compaction", {"title": step_context.title})
@@ -778,6 +1251,18 @@ class Agent:
                         print(f"      -> ERROR: {e}")
                         tool_results.append(ToolResult(tool_call_id=call.id, content=f"ERROR: {e}", is_error=True))
                     self.session.log_event("tool_call", {"name": call.name})
+                    if call.name in ("write_file", "edit_file") and not tool_results[-1].is_error:
+                        target = call.input.get("path") or ""
+                        if target:
+                            dirty_files.add(target)
+                    if call.name in ("read_file", "search_code") and not tool_results[-1].is_error:
+                        target = call.input.get("path") or call.input.get("query") or ""
+                        inner_exploration_log.append((f"{call.name}({target})", tool_results[-1].content))
+                        if call.name == "read_file" and target:
+                            inner_files_since_condense.add(target)
+                            if len(inner_files_since_condense) >= condense_batch_size:
+                                self._condense_batch(state, inner_files_since_condense, inner_exploration_log)
+                                inner_files_since_condense = set()
 
                 if discard_call is not None:
                     # Voluntary clean-slate reset -- deliberately does NOT
@@ -824,10 +1309,22 @@ class Agent:
                     else:
                         new_cmd = str(revise_call.input.get("new_acceptance_command", "")).strip()
                         reason = str(revise_call.input.get("reason", ""))
+                        revise_problem = _validate_acceptance_command(new_cmd) if new_cmd else None
                         if not new_cmd:
                             tool_results.append(ToolResult(
                                 tool_call_id=revise_call.id, is_error=True,
                                 content="new_acceptance_command must be non-empty",
+                            ))
+                        elif revise_problem:
+                            tool_results.append(ToolResult(
+                                tool_call_id=revise_call.id, is_error=True,
+                                content=(
+                                    f"new_acceptance_command is invalid and would fail every "
+                                    f"time: {revise_problem}\nCommand was: {new_cmd}\n"
+                                    "This attempt at revise_acceptance_command was rejected and "
+                                    "does not count against your one revision -- call it again "
+                                    "with a corrected command."
+                                ),
                             ))
                         else:
                             old_cmd = step_context.acceptance_command
@@ -878,6 +1375,8 @@ class Agent:
                         self.workspace.git_commit_all(
                             f"[autocoder] step {state.next_index()}: {step_context.title}\n\n{summary}"
                         )
+                        if dirty_files:
+                            self._flush_dirty_condensed(state, dirty_files)
                         if last_failure_detail:
                             self.lessons.add(
                                 context=f"step: {step_context.title}",
@@ -944,6 +1443,7 @@ class Agent:
                         report = self._build_state_report(
                             step_context, attempts,
                             self.config.budget.max_subtask_attempts, last_check_summary,
+                            state.condensed_files,
                         )
                         history = compact_history_with_state_report(history, report)
                         self.session.log_event("state_report_compaction", {"title": step_context.title})
@@ -1104,6 +1604,19 @@ Rules:
   mark_step_done re-verifies your work with a real acceptance command.
   A change made without that verification could silently regress something
   that already passed and was committed, with nothing catching it.
+- run_command IS available here, but for read-only investigation only --
+  listing, reading, compiling, running tests. It will be rejected if it
+  looks like it would create, modify, delete, or install anything (that's
+  still a mutation without verification, same reasoning as write_file
+  above, and use of the workspace's real shell doesn't exempt it).
+- This includes non-code deliverables (a summary, a report, any file with
+  real content) -- there is no other way to create or write one from here.
+  On Windows specifically, run_command can't build multi-line file content
+  at all (no heredocs, no multi-line `python -c`), so a document-writing
+  goal MUST go through propose_step to get write_file, even though nothing
+  about the task looks like "coding". Trying to assemble a file line by
+  line through repeated single-line shell commands is fragile and NOT a
+  substitute -- propose_step for it instead.
 - propose_step ONE step at a time. Do not plan ahead; decide after seeing
   real evidence from the previous step.
 - Every acceptance_command must be a real shell command that exits 0 on
@@ -1251,6 +1764,20 @@ def _find_missing_stdlib_imports(code: str) -> list[str]:
         name for name in used_as_module_base
         if name in _COMMON_STDLIB_MODULES and name not in imported and name not in locally_bound
     )
+
+
+# Command-starting tokens that don't exist on cmd.exe -- catches the same
+# failure shape as the python -c checks below: a command that would fail
+# every single time on this machine regardless of what gets implemented,
+# discovered only after burning a full attempt (and, before the stash fix
+# above, after the edit that would have passed it was destroyed).
+def _validate_acceptance_command(acceptance_cmd: str) -> str | None:
+    """Runs all cheap, deterministic acceptance_command checks and returns
+    the first problem found, or None. OS-compatibility check now lives in
+    tools.validate_command_for_os, shared with run_command's own gate in
+    run_gated_command, so the same set of known-bad patterns is caught in
+    both places instead of only at acceptance-check time."""
+    return validate_command_for_os(acceptance_cmd) or _validate_python_dash_c_syntax(acceptance_cmd)
 
 
 def _validate_python_dash_c_syntax(acceptance_cmd: str) -> str | None:

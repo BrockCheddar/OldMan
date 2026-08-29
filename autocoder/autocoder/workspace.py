@@ -279,7 +279,21 @@ class Workspace:
         return self._git(["commit", "-m", message, "--allow-empty-message", "--allow-empty"])
 
     def git_revert_to_last_commit(self) -> CommandResult:
-        """Discard all uncommitted changes -- the 'undo' primitive."""
+        """
+        Undo the current attempt's uncommitted changes so the next attempt
+        starts from a clean, known-good HEAD -- but recoverably. A bad
+        acceptance_command (e.g. a POSIX-only check run on Windows) fails
+        for a reason that has nothing to do with the actual edit, and
+        `git reset --hard` + `git clean -fd` alone deletes that edit
+        permanently with no way back. Stashing first (including untracked
+        files, via -u) means the work is still recoverable with
+        `git stash list` / `git stash pop` even after the run gives up on
+        this step, rather than being gone the moment the check exits
+        non-zero.
+        """
+        stash = self._git(["stash", "push", "-u", "-m", "autocoder: pre-revert safety stash"])
+        if "No local changes to save" in (stash.stdout + stash.stderr):
+            return self._git(["clean", "-fd"])
         self._git(["reset", "--hard", "HEAD"])
         return self._git(["clean", "-fd"])
 

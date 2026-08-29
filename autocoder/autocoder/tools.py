@@ -10,13 +10,171 @@ from __future__ import annotations
 
 import fnmatch
 import os
+import platform
+import re
 from pathlib import Path
 from typing import Any, Callable
 
-from .approval import ApprovalDecision, classify_command, confirm_with_human, ask_human_question
+from .approval import (
+    ApprovalDecision, classify_command, confirm_with_human, ask_human_question,
+    detect_workspace_escape, split_command_segments,
+)
 from .config import Config
 from .decisions import DecisionsStore
 from .workspace import CommandResult, Workspace, WorkspaceError
+
+# Real Windows/POSIX incompatibilities confirmed in practice, not just
+# theorized -- each of these has been observed actually breaking a run:
+#   - leading POSIX-only tool names: acceptance_command using `test -f` on
+#     cmd.exe (silently destroyed generated work via git revert before the
+#     git-stash fix existed).
+#   - embedded literal newlines: a multi-line `python -c "\n...` command
+#     passed through `cmd /c "..."` -- cmd.exe's parsing of multi-line /c
+#     arguments is fragile and commonly mis-splits or mis-quotes, causing
+#     the command to silently do nothing or something unintended.
+#   - heredoc (`<<`): has no meaning in cmd.exe at all; `cat > x << 'EOF'`
+#     fails outright (confirmed: the target file was never even created).
+_WINDOWS_INCOMPATIBLE_LEADING_TOKENS = {
+    "test", "[", "rm", "ls", "cat", "grep", "find", "touch", "mkdir",
+    "which", "head", "tail", "chmod", "sh", "bash",
+}
+
+
+def validate_command_for_os(command: str) -> str | None:
+    """Best-effort: flag a shell command (whether it's an acceptance check
+    or an ordinary run_command call) that will fail every time on this
+    machine's actual shell, before it ever runs. Narrow on purpose --
+    false negatives just mean the command runs and fails normally like any
+    other failed command; false positives would block valid work. Applies
+    equally to run_command tool calls and acceptance_command execution,
+    since both go through the same shell and the same failure modes were
+    observed in both places."""
+    if platform.system() != "Windows":
+        return None
+    if "\n" in command:
+        return (
+            "command contains an embedded newline -- multi-line commands run through "
+            "Windows cmd.exe (`cmd /c \"...\"`) are unreliable and commonly get mis-parsed "
+            "or silently do nothing, especially combined with quotes. Keep it to a single "
+            "line, or write a script file first (e.g. via write_file) and run it with a "
+            "short single-line command like `python script.py`."
+        )
+    if "<<" in command:
+        return (
+            "command uses a heredoc (<<), which has no equivalent in Windows cmd.exe and "
+            "will fail outright. Write the content with write_file instead, or use a "
+            "single-line `python -c \"...\"` command."
+        )
+    segments = re.split(r"&&|\|\||;", command)
+    for segment in segments:
+        tokens = segment.strip().split()
+        if not tokens:
+            continue
+        head = tokens[0]
+        if head in _WINDOWS_INCOMPATIBLE_LEADING_TOKENS:
+            return (
+                f"command uses `{head}`, which doesn't exist on this machine's shell "
+                "(Windows cmd.exe) and would fail every time. Use a `python -c \"...\"` "
+                "one-liner instead, or write_file for creating/editing files."
+            )
+        if "/dev/null" in segment:
+            return (
+                "command redirects to /dev/null, which doesn't exist on Windows and will "
+                "error instead of silencing output. Use `2>nul` or drop the redirect."
+            )
+    return None
+
+
+# Leading verbs (per segment, after splitting on &&/||/;/|) that mutate the
+# filesystem in some way -- creating, deleting, moving, copying, or
+# installing something. Covers both POSIX and Windows spellings since a
+# model may reach for either regardless of which shell actually runs it.
+_MUTATING_LEADING_TOKENS = {
+    "rm", "del", "erase", "rd", "rmdir", "md", "mkdir",
+    "mv", "move", "cp", "copy", "ren", "rename", "xcopy", "robocopy",
+    "touch", "tee",
+}
+# Package managers are only mutating for specific subcommands -- "pip
+# show"/"npm list"/"go vet" are legitimate read-only investigation and
+# must stay allowed; "pip install"/"npm add"/"go get" actually change the
+# workspace (installed packages, lockfiles, go.sum) and shouldn't.
+_MUTATING_PACKAGE_MANAGER_SUBCOMMANDS = {
+    "pip": {"install", "uninstall"},
+    "pip3": {"install", "uninstall"},
+    "npm": {"install", "i", "uninstall", "remove", "rm", "add", "ci", "update"},
+    "yarn": {"add", "remove", "install", "upgrade"},
+    "cargo": {"add", "remove", "install", "update"},
+    "go": {"get", "install", "mod"},
+}
+# Same idea for git subcommands specifically -- "git status"/"git diff"/
+# "git log" are read-only and fine; these change tracked or working-tree
+# state.
+_MUTATING_GIT_SUBCOMMANDS = {
+    "add", "commit", "checkout", "restore", "apply", "merge", "rebase",
+    "reset", "stash", "clean", "rm", "mv",
+}
+# In-place edit flags, checked as a substring since they can appear
+# anywhere in a segment's arguments, not just as the leading token.
+_IN_PLACE_EDIT_MARKERS = ("sed -i", "perl -i")
+# Best-effort textual signals that an embedded script (most commonly a
+# `python -c "..."` one-liner, but this deliberately isn't limited to that
+# shape) writes to the filesystem. Checked against the whole command, not
+# per segment, since these appear inside a quoted argument.
+_SCRIPTED_WRITE_MARKERS = (
+    "write_text(", "write_bytes(", ".write(", "os.remove(", "os.unlink(",
+    "os.rename(", "os.replace(", "os.makedirs(", "os.mkdir(",
+    "shutil.copy", "shutil.move", "shutil.rmtree",
+)
+_OPEN_WRITE_MODE_RE = re.compile(r"""open\([^)]*['"][wax]\+?b?['"]""")
+
+
+def looks_like_mutating_command(command: str) -> str | None:
+    """Best-effort: flag a run_command invocation that appears to create,
+    modify, move, or delete something in the workspace (or install a
+    dependency into it), for the outer loop specifically to reject the
+    same way it already rejects write_file/edit_file -- see
+    _OUTER_SAFE_TOOL_NAMES in agent.py. The inner loop does NOT use this:
+    a step's mutations are already scoped by the revert-on-fail/commit-on-
+    accept cycle around mark_step_done, so run_command there doesn't need
+    a separate mutation ban the way the outer loop (which has no such
+    cycle at all) does.
+
+    Same philosophy as validate_command_for_os: a text pattern match on an
+    arbitrary shell/script string, not a real parser. False negatives just
+    mean an unverified mutation slips through uncaught, same as before this
+    existed; false positives would block legitimate read-only exploration,
+    which is the worse failure to bias against here.
+    """
+    if _OPEN_WRITE_MODE_RE.search(command):
+        return "opens a file in a write/append mode"
+    lowered = command.lower()
+    for marker in _SCRIPTED_WRITE_MARKERS:
+        if marker in lowered:
+            return f"contains '{marker.rstrip('(')}', which writes to the filesystem"
+    for marker in _IN_PLACE_EDIT_MARKERS:
+        if marker in lowered:
+            return f"uses '{marker}' (in-place file edit)"
+    segments = split_command_segments(command)
+    if segments is None:
+        return None  # unbalanced quotes: validate_command_for_os already flags this separately
+    for segment in segments:
+        tokens = segment.strip().split()
+        if not tokens:
+            continue
+        head = tokens[0].lower()
+        if head in _MUTATING_LEADING_TOKENS:
+            return f"uses `{head}`, which mutates the filesystem"
+        pkg_subcommands = _MUTATING_PACKAGE_MANAGER_SUBCOMMANDS.get(head)
+        if pkg_subcommands and len(tokens) > 1 and tokens[1].lower() in pkg_subcommands:
+            return f"uses `{head} {tokens[1].lower()}`, which installs/modifies dependencies"
+        if head == "git" and len(tokens) > 1 and tokens[1].lower() in _MUTATING_GIT_SUBCOMMANDS:
+            return f"uses `git {tokens[1].lower()}`, which changes repo state"
+        # A redirect into a real file (not a discard target) writes to the
+        # workspace regardless of which command precedes it.
+        redirect = re.search(r"(?<![0-9&])(>{1,2})(?!&)\s*(\S+)", segment)
+        if redirect and redirect.group(2).lower() not in ("nul", "/dev/null"):
+            return f"redirects output to '{redirect.group(2)}'"
+    return None
 
 IGNORE_DIR_NAMES = {".git", "node_modules", "__pycache__", ".venv", "venv",
                     ".autocoder", "dist", "build", ".mypy_cache", ".pytest_cache"}
@@ -407,7 +565,25 @@ class ToolBox:
         A denied command returns exit_code=1 with an explanatory stderr
         rather than raising, matching how a real failing check looks.
         """
+        os_problem = validate_command_for_os(command)
+        if os_problem:
+            return CommandResult(
+                command=command, exit_code=1, stdout="",
+                stderr=f"[REJECTED -- would fail on this OS] {os_problem}", duration_s=0.0,
+            )
         decision = classify_command(command, self.config.approval)
+        escape_reason = detect_workspace_escape(command)
+        if escape_reason:
+            # Overrides classify_command's own decision, including under
+            # "auto" mode -- an escape-looking command is exactly the case
+            # "auto" shouldn't get to skip past silently. Still just a
+            # confirmation prompt, not a hard block: this is a best-effort
+            # pattern match (see detect_workspace_escape), not a real
+            # sandbox boundary, so a human gets the final call rather than
+            # the harness assuming the worst and refusing outright.
+            decision = ApprovalDecision(
+                True, f"command {escape_reason} -- may reach outside the workspace"
+            )
         approved = True
         if decision.needs_confirmation:
             if self._confirm_hook is not None:
