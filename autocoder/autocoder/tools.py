@@ -193,7 +193,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "properties": {
                 "path": {"type": "string", "description": "Path relative to the workspace root."},
                 "offset": {"type": "integer", "description": "1-indexed line number to start at.", "default": 1},
-                "limit": {"type": "integer", "description": "Max lines to return.", "default": 2000},
+                "limit": {"type": "integer", "description": "Max lines to return.", "default": 400},
             },
             "required": ["path"],
         },

@@ -563,7 +563,8 @@ class Agent:
     # ── outer loop: choose next step ───────────────────────────────────────
 
     def _build_outer_state_report(self, state: RunState,
-                                   exploration_log: list[tuple[str, str]] | None = None) -> str:
+                                   exploration_log: list[tuple[str, str]] | None = None,
+                                   final_acceptance_command: str | None = None) -> str:
         """
         Same idea as _build_state_report, applied at the run level instead
         of the step level. Built entirely from live checks against the
@@ -583,11 +584,19 @@ class Agent:
             "STATE REPORT (outer loop)",
             f"Goal: {state.goal}",
             "",
+        ]
+        if final_acceptance_command:
+            lines.append(
+                f"Goal-level completion check (run it yourself via run_command before "
+                f"deciding whether to keep going): $ {final_acceptance_command}"
+            )
+            lines.append("")
+        lines.extend([
             f"Completed steps so far:\n{state.completed_summary_text()}",
             "",
             f"Scratchpad:\n{state.scratchpad or '(empty)'}",
             "",
-        ]
+        ])
         if state.condensed_files:
             lines.append(f"Harness-condensed per-file understanding built while reading so far "
                          f"(check this before reading more -- if it already covers what you "
@@ -690,6 +699,23 @@ class Agent:
         # last condensation pass.
         files_since_condense: set[str] = set()
         condense_batch_size = self._condensation_batch_size()
+        # Consecutive count of propose_step calls made while the goal-level
+        # acceptance command was already passing. Reset whenever a proposal
+        # happens while it's genuinely not passing yet (a legitimately
+        # different situation). See the propose_step handling below for why
+        # this exists and what happens at each count.
+        redundant_step_attempts = 0
+        # Files targeted by the most recently COMPLETED step, so the
+        # redundancy gate below can tell "a new step re-targeting the same
+        # deliverable while the goal check already passes" (the real,
+        # demonstrated failure) apart from "a new, unrelated step happens to
+        # be proposed after the goal's proxy check already passes" (which a
+        # goal with a narrow/coincidentally-satisfied acceptance command
+        # would trigger constantly and wrongly). Only ever compares against
+        # the LAST step, not every step ever completed -- narrower, but
+        # matches the actual evidence (two consecutive steps, same file)
+        # without guessing how far back to look.
+        last_completed_step_files: set[str] = set()
 
         while state.status == "running":
             # Reset for record_decision's originating_step -- _inner_loop
@@ -708,7 +734,7 @@ class Agent:
                     return
                 continue
 
-            system = self._outer_system_prompt(state)
+            system = self._outer_system_prompt(state, final_acceptance_command)
             # condensed_notes was previously only shown at the propose_step
             # handoff and inside the inner loop -- meaning the model could
             # be sitting on a harness-built, near-complete understanding of
@@ -741,7 +767,7 @@ class Agent:
                     "or a workspace tool if you need to explore first."
                 )))
                 if self._prompt_over_budget(system, history, OUTER_TOOLS):
-                    report = self._build_outer_state_report(state, exploration_log)
+                    report = self._build_outer_state_report(state, exploration_log, final_acceptance_command)
                     history = compact_history_with_state_report(history, report)
                     self.session.log_event("state_report_compaction", {"scope": "outer"})
                 continue
@@ -830,6 +856,73 @@ class Agent:
                         ))
                         acted = True
                         continue
+
+                    # A new step proposed while the goal-level check already
+                    # passes is a real, demonstrated failure mode -- not
+                    # hypothetical: a run kept the goal-level check passing
+                    # after step 1, then spent another ~60 minutes producing
+                    # a byte-identical rewrite via step 2 anyway. An
+                    # advisory-only response to that (like the repetition
+                    # notices below, which the same run also ignored twice)
+                    # isn't enough -- this gets one real rejection with a
+                    # concrete ask, then auto-completes rather than trusting
+                    # a third attempt behaves differently.
+                    if final_acceptance_command and state.completed_steps and last_completed_step_files \
+                            and (set(str(x) for x in files) & last_completed_step_files):
+                        already_passing, _ = self._run_final_acceptance_command(final_acceptance_command)
+                        if already_passing:
+                            redundant_step_attempts += 1
+                            if redundant_step_attempts >= 2:
+                                accepted, feedback = self._verify_done(
+                                    state,
+                                    "goal-level acceptance command was already passing when a "
+                                    "redundant step was proposed for the second time in a row -- "
+                                    "auto-completed rather than allowing another unnecessary step",
+                                    final_acceptance_command,
+                                )
+                                if accepted:
+                                    state.status = "done"
+                                    self._finalize_pending_lesson(
+                                        fix_summary="goal accepted as done: auto-completed after a "
+                                                    "redundant step proposal")
+                                    self.session.save_state(state)
+                                    return
+                                # regression check (part of _verify_done) failed even though the
+                                # acceptance command alone passed moments ago -- genuinely let it
+                                # continue rather than force-closing on a real problem.
+                                redundant_step_attempts = 0
+                                self._set_scratchpad(
+                                    state, state.scratchpad +
+                                    f"\n[Feedback on auto-completion attempt]: {feedback}")
+                                self.session.save_state(state)
+                                tool_results.append(ToolResult(
+                                    tool_call_id=call.id, is_error=True,
+                                    content=f"Auto-completion check failed.\n{feedback}\nContinuing "
+                                            "with this step proposal.",
+                                ))
+                                acted = True
+                                continue
+                            self.session.log_event("propose_step_rejected", {
+                                "title": title, "reason": "goal-level acceptance already passing",
+                            })
+                            tool_results.append(ToolResult(
+                                tool_call_id=call.id, is_error=True,
+                                content=(
+                                    "The goal-level acceptance command already passes right now -- "
+                                    "the goal appears to already be satisfied by what's been done so "
+                                    "far. If you believe more work is genuinely needed, your next "
+                                    "propose_step must name the SPECIFIC problem you're fixing (not a "
+                                    "general redo of the same deliverable). If the goal is actually "
+                                    "done, call declare_done instead."
+                                ),
+                            ))
+                            acted = True
+                            continue
+                        else:
+                            redundant_step_attempts = 0
+                    else:
+                        redundant_step_attempts = 0
+
                     self.session.log_event("propose_step_accepted", {"title": title})
                     findings = _merge_exploration_into_findings(findings, exploration_log, state.condensed_files)
                     step_context = StepContext(
@@ -864,7 +957,9 @@ class Agent:
                         acted = True
                         break
                     state.completed_steps.append(completed)
+                    last_completed_step_files = set(step_context.files)
                     state.status = "running"
+                    repetition_guard.checkpoint()
                     self._finalize_pending_lesson(fix_summary=f"step '{title}' completed: {completed.summary}")
                     self.session.save_state(state)
                     self.session.log_event("step_completed", {"index": completed.index, "title": completed.title})
@@ -1007,7 +1102,7 @@ class Agent:
             if tool_results and not history_reset:
                 history.append(Turn(role="tool_results", tool_results=tool_results))
                 if self._prompt_over_budget(system, history, OUTER_TOOLS):
-                    report = self._build_outer_state_report(state, exploration_log)
+                    report = self._build_outer_state_report(state, exploration_log, final_acceptance_command)
                     history = compact_history_with_state_report(history, report)
                     self.session.log_event("state_report_compaction", {"scope": "outer"})
 
@@ -1490,36 +1585,58 @@ class Agent:
             return False, regression_feedback
 
         if final_acceptance_command:
-            print(f"[done-check] {final_acceptance_command}")
-            result = self.toolbox.run_gated_command(
-                final_acceptance_command,
-                timeout=self.config.budget.default_command_timeout,
-            )
-            if result.exit_code == 0 and not result.timed_out:
-                print(f"[done-check] PASSED")
-                return True, ""
-            print(f"[done-check] FAILED (exit {result.exit_code})")
-            print(result.stdout[-2000:])
-            print(result.stderr[-2000:])
-            feedback = (
-                f"Final acceptance check FAILED.\n$ {final_acceptance_command}\n"
-                f"exit {result.exit_code}{' (TIMED OUT)' if result.timed_out else ''}\n"
-                f"stdout:\n{result.stdout[-2000:]}\nstderr:\n{result.stderr[-2000:]}"
-            )
-            return False, feedback
+            return self._run_final_acceptance_command(final_acceptance_command)
 
         # No final acceptance command -- ask the human.
         print(f"\n[done] model declares goal complete:\n  {summary}")
         self.budget.pause()
-        answer = input("Accept as done? [y/N]: ").strip().lower()
+        try:
+            answer = input("Accept as done? [y/N]: ").strip().lower()
+        except EOFError:
+            # No one's there to answer -- an unattended run with no TTY.
+            # Left uncaught this crashes the whole run right as it was
+            # trying to finish cleanly. Default to the same outcome a
+            # human declining silently would produce.
+            print("[no input available -- treating as not accepted]")
+            self.budget.resume()
+            return False, ("No human was available to confirm completion (unattended run, "
+                            "no TTY). Re-examine your work critically, or supply a final "
+                            "acceptance command next run so this can be checked automatically.")
         if answer in ("y", "yes"):
             self.budget.resume()
             return True, ""
-        reason = input("What's missing or not right? (sent back to the agent): ").strip()
+        try:
+            reason = input("What's missing or not right? (sent back to the agent): ").strip()
+        except EOFError:
+            reason = ""
         self.budget.resume()
         if not reason:
             reason = "Human rejected without giving a specific reason. Re-examine your work critically."
         return False, reason
+
+    def _run_final_acceptance_command(self, final_acceptance_command: str) -> tuple[bool, str]:
+        """Runs the goal-level acceptance command and returns (accepted,
+        feedback), same contract as _verify_done. Split out so the outer
+        loop can also run this speculatively -- e.g. before letting a new
+        propose_step through -- without duplicating the command-execution
+        and feedback-formatting logic."""
+        print(f"[done-check] {final_acceptance_command}")
+        result = self.toolbox.run_gated_command(
+            final_acceptance_command,
+            timeout=self.config.budget.default_command_timeout,
+        )
+        if result.exit_code == 0 and not result.timed_out:
+            print(f"[done-check] PASSED")
+            return True, ""
+        print(f"[done-check] FAILED (exit {result.exit_code})")
+        print(result.stdout[-2000:])
+        print(result.stderr[-2000:])
+        feedback = (
+            f"Final acceptance check FAILED.\n$ {final_acceptance_command}\n"
+            f"exit {result.exit_code}{' (TIMED OUT)' if result.timed_out else ''}\n"
+            f"stdout:\n{result.stdout[-2000:]}\nstderr:\n{result.stderr[-2000:]}"
+        )
+        return False, feedback
 
     def _finalize_pending_lesson(self, fix_summary: str) -> None:
         pending = self._pending_escalation_lesson
@@ -1563,12 +1680,31 @@ class Agent:
 
     # ── system prompts ─────────────────────────────────────────────────────
 
-    def _outer_system_prompt(self, state: RunState) -> str:
+    def _outer_system_prompt(self, state: RunState, final_acceptance_command: str | None = None) -> str:
+        if final_acceptance_command:
+            goal_check_section = f"""GOAL-LEVEL COMPLETION CHECK: the overall goal is considered complete once
+this exact command exits 0:
+    $ {final_acceptance_command}
+You can run this yourself via run_command at any point to check where you
+actually stand -- it's read-only investigation, not a mutation, so it's
+allowed here. Checking it before deciding whether to propose another step
+or call declare_done costs you one tool call and removes the guesswork.
+Note this is still just a mechanical proxy for the goal, not a substitute
+for actually thinking the goal is met -- passing it doesn't excuse
+incomplete or careless work, and it failing doesn't necessarily mean your
+last step was wrong."""
+        else:
+            goal_check_section = (
+                "GOAL-LEVEL COMPLETION CHECK: none was supplied for this run -- "
+                "declare_done will ask a human to confirm completion instead."
+            )
         return f"""You are an autonomous coding agent working in a real git repository.
 
 OS: {shell_description()}
 
 GOAL: {state.goal}
+
+{goal_check_section}
 
 LESSONS FROM PAST RUNS IN THIS WORKSPACE (verified -- each was an actual problem
 followed by a confirmed successful outcome, not a guess):

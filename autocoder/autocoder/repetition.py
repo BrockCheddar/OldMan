@@ -38,6 +38,30 @@ DEFAULT_CYCLE_WINDOW = 30
 DEFAULT_CYCLE_DISTINCT_MAX = 15
 DEFAULT_CYCLE_FORCE_ESCALATE_AFTER_FIRES = 2
 
+# Stall detector: catches what the other two structurally cannot. Confirmed
+# needed in practice -- a real run touched close to 20 distinct files across
+# a single step (list_dir, several read_files, several ast/regex probe
+# scripts via run_command), never hit the same exact target 4x running, and
+# never sat in a narrow enough rotation to trip the cyclic window either --
+# genuinely broad, always-technically-new-looking exploration, for dozens of
+# calls, with zero acceptance-check attempts the entire time. Consecutive
+# and cyclic both key off REPEATING something; this keys off the total
+# count since the last real checkpoint, so it doesn't matter whether the
+# model keeps finding new things to look at -- if none of it has been
+# checked against reality in a long time, that's the signal, independent of
+# whether any single target repeats.
+DEFAULT_STALL_THRESHOLD = 25
+DEFAULT_STALL_FORCE_ESCALATE_AFTER_FIRES = 2
+
+_STALL_WARNING_TEMPLATE = (
+    "[STALL NOTICE] {n} tool calls with no acceptance-check attempt (mark_step_done "
+    "or declare_done, pass or fail) succeeding or failing in between. Constantly "
+    "varying what you look at avoids the other repetition detectors, but it still "
+    "isn't progress if none of it has been checked against reality. Propose a step "
+    "and call mark_step_done with what you already know, or declare_done if the "
+    "goal-level check already passes -- don't keep exploring indefinitely."
+)
+
 
 def _target_key(name: str, tool_input: dict[str, Any]) -> str:
     """What counts as 'the same thing' for repetition purposes: the path for
@@ -56,7 +80,9 @@ class RepetitionGuard:
                  force_escalate_after_fires: int = DEFAULT_FORCE_ESCALATE_AFTER_FIRES,
                  cycle_window: int = DEFAULT_CYCLE_WINDOW,
                  cycle_distinct_max: int = DEFAULT_CYCLE_DISTINCT_MAX,
-                 cycle_force_escalate_after_fires: int = DEFAULT_CYCLE_FORCE_ESCALATE_AFTER_FIRES):
+                 cycle_force_escalate_after_fires: int = DEFAULT_CYCLE_FORCE_ESCALATE_AFTER_FIRES,
+                 stall_threshold: int = DEFAULT_STALL_THRESHOLD,
+                 stall_force_escalate_after_fires: int = DEFAULT_STALL_FORCE_ESCALATE_AFTER_FIRES):
         self.threshold = threshold
         self.force_escalate_after_fires = force_escalate_after_fires
         self._last_key: str | None = None
@@ -67,6 +93,37 @@ class RepetitionGuard:
         self.cycle_force_escalate_after_fires = cycle_force_escalate_after_fires
         self._window: deque[str] = deque(maxlen=cycle_window)
         self._cycle_fire_count: int = 0
+
+        self.stall_threshold = stall_threshold
+        self.stall_force_escalate_after_fires = stall_force_escalate_after_fires
+        self._calls_since_checkpoint: int = 0
+        self._stall_fire_count: int = 0
+
+        # Tracks the offset of the last read_file call on the current
+        # _last_key, so forward pagination through one large file isn't
+        # mistaken for repetition. See _is_forward_pagination below.
+        self._last_read_offset: int | None = None
+
+    @staticmethod
+    def _is_forward_pagination(name: str, tool_input: dict[str, Any],
+                                same_key: bool, last_offset: int | None) -> bool:
+        """True when this is a read_file call that picks up exactly where
+        the previous call on the SAME file left off (or later) -- genuine
+        progress through a large file, not the same region re-read. Confirmed
+        necessary: shrinking read_file's default page size means a large
+        file now legitimately takes several consecutive calls to get
+        through, and the consecutive-repetition key is just the path (by
+        design -- see _target_key), so without this check that pagination
+        alone trips the same-target-N-times-in-a-row detector on its own,
+        false-flagging the exact paginate-don't-dump-the-whole-file behavior
+        the harness wants to encourage. Only forward, non-overlapping
+        progress counts -- re-reading the same offset, or going backward,
+        is still exactly the "not making progress" pattern the detector is
+        supposed to catch, so those still count as repetition."""
+        if not same_key or name != "read_file" or last_offset is None:
+            return False
+        offset = int(tool_input.get("offset", 1))
+        return offset > last_offset
 
     def record(self, name: str, tool_input: dict[str, Any]) -> str | None:
         """Call after a tool is dispatched. Returns a warning string every
@@ -83,11 +140,37 @@ class RepetitionGuard:
         call, both notices are concatenated so nothing is silently
         dropped."""
         key = _target_key(name, tool_input)
-        if key == self._last_key:
+        same_key = (key == self._last_key)
+        forward_pagination = self._is_forward_pagination(
+            name, tool_input, same_key, self._last_read_offset)
+
+        if name == "read_file":
+            self._last_read_offset = int(tool_input.get("offset", 1))
+        elif not same_key:
+            self._last_read_offset = None
+
+        if forward_pagination:
+            # Real progress through the same file -- neither increment the
+            # consecutive count nor feed the cyclic window as a repeat of
+            # this key, but don't reset _consecutive_count to 0 either:
+            # a model that paginates forward for a while and then genuinely
+            # starts thrashing on the same file (offset stops advancing)
+            # should still accumulate from where it left off, not get a
+            # fresh grace period just because some of the reads happened to
+            # be legitimate.
+            self._last_key = key
+            self._calls_since_checkpoint += 1
+            stall_warning = None
+            if self._calls_since_checkpoint % self.stall_threshold == 0:
+                self._stall_fire_count += 1
+                stall_warning = _STALL_WARNING_TEMPLATE.format(n=self._calls_since_checkpoint)
+            return stall_warning
+        if same_key:
             self._consecutive_count += 1
         else:
             self._last_key = key
             self._consecutive_count = 1
+        self._calls_since_checkpoint += 1
 
         consecutive_warning = None
         if self._consecutive_count % self.threshold == 0:
@@ -119,23 +202,30 @@ class RepetitionGuard:
                 )
                 self._window.clear()  # avoid firing again on every subsequent call
 
-        if consecutive_warning and cyclic_warning:
-            return f"{consecutive_warning}\n\n{cyclic_warning}"
-        return consecutive_warning or cyclic_warning
+        stall_warning = None
+        if self._calls_since_checkpoint % self.stall_threshold == 0:
+            self._stall_fire_count += 1
+            stall_warning = _STALL_WARNING_TEMPLATE.format(n=self._calls_since_checkpoint)
+
+        warnings = [w for w in (consecutive_warning, cyclic_warning, stall_warning) if w]
+        return "\n\n".join(warnings) if warnings else None
 
     def should_force_escalate(self) -> bool:
-        """True once either detector has fired repeatedly without the model
+        """True once any detector has fired repeatedly without the model
         self-correcting. Consecutive: confirmed in practice, notice fired 3
         separate times and the model kept repeating anyway. Cyclic: lower
         threshold (2) since each fire already represents a full window's
-        worth (16 calls) of confirmed non-progress, a much stronger signal
-        per-fire than the consecutive case."""
+        worth (30 calls) of confirmed non-progress, a much stronger signal
+        per-fire than the consecutive case. Stall: same reasoning as cyclic
+        -- two fires means 50 calls with zero verification, regardless of
+        how varied they looked."""
         return (self._fire_count >= self.force_escalate_after_fires
-                or self._cycle_fire_count >= self.cycle_force_escalate_after_fires)
+                or self._cycle_fire_count >= self.cycle_force_escalate_after_fires
+                or self._stall_fire_count >= self.stall_force_escalate_after_fires)
 
     def checkpoint(self) -> None:
         """Call after any acceptance-check attempt (pass or fail) -- that's
-        a genuine verification step, so both detectors reset rather than
+        a genuine verification step, so all detectors reset rather than
         penalizing a model that's correctly iterating: try, check, adjust,
         check again."""
         self._last_key = None
@@ -143,3 +233,6 @@ class RepetitionGuard:
         self._fire_count = 0
         self._window.clear()
         self._cycle_fire_count = 0
+        self._calls_since_checkpoint = 0
+        self._stall_fire_count = 0
+        self._last_read_offset = None
