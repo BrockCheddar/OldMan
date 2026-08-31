@@ -1,0 +1,193 @@
+"""
+Approval gates (Phase 7): anything irreversible or externally visible should
+get a human's eyes on it before it runs, unless the policy is set to "auto".
+
+This module only decides WHETHER to ask and prints the prompt; it never
+silently escalates privilege and never runs anything itself.
+"""
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+
+from .config import ApprovalPolicy, ALWAYS_CONFIRM_SUBSTRINGS, SAFE_COMMAND_PREFIXES
+
+# A bare "cd <dir>" (or "cd /d <dir>" on Windows for a cross-drive change)
+# segment doesn't itself need approval: each run_command call is a fresh
+# subprocess rooted at the workspace anyway (see workspace.py), so `cd` only
+# affects that one invocation, never the harness's own state or a later
+# call. This is checked per-segment below, after splitting -- the
+# ALWAYS_CONFIRM_SUBSTRINGS check still runs against the full original
+# command first, so this can't be used to sneak a dangerous command past it.
+_CD_SEGMENT_RE = re.compile(r"^cd(?:\s+/d)?\s+\S+$", re.IGNORECASE)
+
+# Best-effort, deliberately narrow signals that a command's ARGUMENTS (not
+# just its verb) reach outside the workspace: literal ".." path traversal,
+# a Windows drive-letter absolute path, or a "~" home-dir reference. This is
+# a text pattern match on an arbitrary shell/script string, not a real
+# parser -- it can't catch every way to reach outside the workspace (e.g.
+# an indirect path built up across several commands, or one hidden inside
+# an env var), and it deliberately does NOT flag a bare leading "/" as an
+# absolute-path signal, since that's also how Windows commands write flags
+# (`dir /s`, `xcopy /e`) -- flagging it would block ordinary in-workspace
+# exploration on the exact platform this tool mainly targets. It exists to
+# catch the common, non-adversarial case (a model wandering with `cd ..` or
+# an absolute path), not to withstand something actively trying to escape.
+_DOTDOT_TRAVERSAL_RE = re.compile(r"(?:^|[\s\"'=(])\.\.(?:[\\/]|$|[\s\"')])")
+_WINDOWS_DRIVE_ABS_RE = re.compile(r"[A-Za-z]:[\\/]")
+_HOME_DIR_RE = re.compile(r"(?:^|\s)~(?:[\\/]|$)")
+
+
+def detect_workspace_escape(command: str) -> str | None:
+    """Returns a short reason if `command` looks like it reaches outside
+    the workspace root, or None. Independent of ApprovalPolicy.mode --
+    callers that want this to force confirmation even under "auto" do so
+    by checking this separately from classify_command, not by routing it
+    through classify_command's mode-aware logic."""
+    if _DOTDOT_TRAVERSAL_RE.search(command):
+        return "contains a '..' path traversal segment"
+    if _WINDOWS_DRIVE_ABS_RE.search(command):
+        return "contains a Windows drive-letter absolute path"
+    if _HOME_DIR_RE.search(command):
+        return "contains a '~' home-directory reference"
+    return None
+
+
+# Two-character operators must be checked before their single-character
+# component (e.g. "&&" before "&", "||" before "|") so a compound operator
+# isn't split in the middle.
+_TWO_CHAR_OPERATORS = ("&&", "||")
+_ONE_CHAR_OPERATORS = (";", "|")
+
+
+def split_command_segments(command: str) -> list[str] | None:
+    """Split a shell command into its individual pipeline/chain segments on
+    &&, ||, ;, and | -- but not when those characters appear inside a
+    quoted string, so e.g. a semicolon embedded in a `python -c "..."`
+    argument isn't mistaken for a second command.
+
+    Returns None if quoting is unbalanced at the end of the string, since
+    that means the split can't be trusted -- callers should treat that as
+    "needs approval" rather than silently classifying on a broken parse.
+
+    This is a classifier, not a full shell parser: it's deliberately
+    conservative (single/double quote tracking only, no backslash-escape
+    handling), which is the right direction to err in for a safety check.
+    """
+    segments: list[str] = []
+    current: list[str] = []
+    in_single = False
+    in_double = False
+    i, n = 0, len(command)
+    while i < n:
+        ch = command[i]
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            current.append(ch)
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+            current.append(ch)
+        elif not in_single and not in_double and command[i:i + 2] in _TWO_CHAR_OPERATORS:
+            segments.append("".join(current))
+            current = []
+            i += 1  # extra advance for the operator's second character
+        elif not in_single and not in_double and ch in _ONE_CHAR_OPERATORS:
+            segments.append("".join(current))
+            current = []
+        else:
+            current.append(ch)
+        i += 1
+    if in_single or in_double:
+        return None
+    segments.append("".join(current))
+    return [s.strip() for s in segments if s.strip()]
+
+
+@dataclass
+class ApprovalDecision:
+    needs_confirmation: bool
+    reason: str
+
+
+def classify_command(command: str, policy: ApprovalPolicy) -> ApprovalDecision:
+    lowered = command.strip().lower()
+
+    if policy.mode == "auto":
+        return ApprovalDecision(False, "approval policy set to auto")
+    if policy.mode == "ask":
+        return ApprovalDecision(True, "approval policy set to ask-always")
+
+    # mode == "smart"
+    for bad in ALWAYS_CONFIRM_SUBSTRINGS:
+        if bad in lowered:
+            return ApprovalDecision(True, f"command contains '{bad.strip()}' (always confirmed)")
+
+    segments = split_command_segments(command)
+    if segments is None:
+        return ApprovalDecision(True, "command has unbalanced quotes and could not be safely classified")
+    if not segments:
+        return ApprovalDecision(True, "empty command")
+
+    matched_prefixes: list[str] = []
+    for seg in segments:
+        seg_lowered = seg.lower()
+        if _CD_SEGMENT_RE.match(seg_lowered):
+            matched_prefixes.append("cd")
+            continue  # bare cd: safe on its own, see comment above
+        hit = next((safe for safe in SAFE_COMMAND_PREFIXES if seg_lowered.startswith(safe)), None)
+        if hit is None:
+            reason = "not on the safe-prefix list"
+            if len(segments) > 1:
+                reason = f"segment '{seg}' is {reason}"
+            return ApprovalDecision(True, reason)
+        matched_prefixes.append(hit)
+
+    if len(segments) > 1:
+        reason = f"every segment matches a safe prefix ({', '.join(matched_prefixes)})"
+    else:
+        reason = f"matches safe read-only prefix '{matched_prefixes[0]}'"
+    return ApprovalDecision(False, reason)
+
+
+def confirm_with_human(prompt: str) -> bool:
+    """Blocking CLI confirmation. Swap this out for a GUI/webhook prompt later
+    without touching any caller -- it's the only place a 'yes' is granted."""
+    print("\n" + "=" * 60)
+    print("APPROVAL REQUIRED")
+    print(prompt)
+    print("=" * 60)
+    try:
+        answer = input("Proceed? [y/N]: ").strip().lower()
+    except EOFError:
+        # No one's there to answer -- e.g. an unattended run with no TTY on
+        # stdin. Silently hanging (it won't -- input() raises immediately)
+        # isn't the risk; an uncaught EOFError propagating up and crashing
+        # the whole harness mid-run is. Default to the same safe outcome a
+        # human declining would produce: deny, and say why, so the model
+        # gets an explanatory tool result instead of the run dying.
+        print("[no input available -- treating as denied]")
+        return False
+    return answer in ("y", "yes")
+
+
+def ask_human_question(question: str) -> str:
+    """Used by the ask_human tool when the model itself is escalating a
+    genuine ambiguity (Phase 4's 'ask a clarifying question' path)."""
+    print("\n" + "-" * 60)
+    print("THE AGENT IS ASKING FOR CLARIFICATION:")
+    print(question)
+    print("-" * 60)
+    try:
+        return input("Your answer: ").strip()
+    except EOFError:
+        # Same unattended-run risk as confirm_with_human above: no TTY on
+        # stdin means input() raises immediately rather than blocking, and
+        # left uncaught that crashes the whole run over a question nobody
+        # was there to answer. Tell the model plainly rather than crashing
+        # or returning an empty string it might mistake for a real answer.
+        print("[no input available -- no one was there to answer]")
+        return ("(no human was available to answer this -- no one is monitoring this "
+                "run right now. Use your own best judgement and proceed, or if you "
+                "genuinely cannot proceed without this answer, treat the goal as "
+                "blocked and explain why in declare_done or an escalation.)")
+
