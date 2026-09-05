@@ -212,3 +212,170 @@ def test_outer_tools_exclude_write_file_and_edit_file():
     assert "search_code" in outer_names
 
 
+
+
+def test_write_file_to_git_hooks_is_refused(tmp_path):
+    """M1 regression: a git hook planted by the model is auto-executing
+    code the harness itself triggers on every `git commit` -- a clean
+    bypass of the approval gate. Writing anywhere under .git/ must be
+    refused, not just escapes outside the workspace."""
+    tb, ws = make_toolbox(tmp_path)
+    with pytest.raises(ToolError, match="protected"):
+        tb.dispatch("write_file", {"path": ".git/hooks/post-commit", "content": "#!/bin/sh\necho pwned\n"})
+
+
+def test_write_file_to_autocoder_session_is_refused(tmp_path):
+    """M1 regression: .autocoder/session.json is the agent's own
+    resumable state (goal, completed-step log) -- the model must not be
+    able to rewrite its own record of what it already did."""
+    tb, ws = make_toolbox(tmp_path)
+    with pytest.raises(ToolError, match="protected"):
+        tb.dispatch("write_file", {"path": ".autocoder/session.json", "content": "{}"})
+
+
+def test_edit_file_to_protected_dir_is_refused(tmp_path):
+    tb, ws = make_toolbox(tmp_path)
+    (ws.root / ".autocoder").mkdir(exist_ok=True)
+    (ws.root / ".autocoder" / "notes.txt").write_text("original", encoding="utf-8")
+    with pytest.raises(ToolError, match="protected"):
+        tb.dispatch("edit_file", {"path": ".autocoder/notes.txt", "old_str": "original", "new_str": "tampered"})
+
+
+def test_read_file_from_protected_dir_still_works(tmp_path):
+    """Only writes are restricted -- reading inside .git/ or .autocoder/
+    (e.g. to debug session state) is unaffected."""
+    tb, ws = make_toolbox(tmp_path)
+    (ws.root / ".autocoder").mkdir(exist_ok=True)
+    (ws.root / ".autocoder" / "notes.txt").write_text("hello", encoding="utf-8")
+    out = tb.dispatch("read_file", {"path": ".autocoder/notes.txt"})
+    assert "hello" in out
+
+
+def test_search_code_via_ripgrep_finds_match(tmp_path):
+    """Exercises the actual ripgrep path (not the pure-Python fallback) --
+    requires `rg` on PATH. Skips cleanly if it isn't installed."""
+    import shutil
+    if shutil.which("rg") is None:
+        pytest.skip("ripgrep not installed")
+    tb, ws = make_toolbox(tmp_path)
+    tb.dispatch("write_file", {"path": "src/main.py", "content": "def target_function():\n    pass\n"})
+    out = tb.dispatch("search_code", {"pattern": "target_function"})
+    assert "main.py" in out.replace("\\", "/")
+    assert "[DENIED" not in out and "error" not in out.lower()
+
+
+def test_search_code_via_ripgrep_handles_shell_special_chars_in_pattern(tmp_path):
+    """M4 regression: the old implementation built a shell command string
+    with shlex.quote() (POSIX-only quoting) and piped through `| head`
+    (no `head` on Windows) -- both silently broke depending on platform
+    and pattern content. Now it's a real argv list with no shell involved,
+    so shell-special characters in the pattern (quotes, pipes, ampersands)
+    are just literal search text, not something that needs escaping."""
+    import shutil
+    if shutil.which("rg") is None:
+        pytest.skip("ripgrep not installed")
+    tb, ws = make_toolbox(tmp_path)
+    tricky = '''cmd = "a" | b && c; echo 'hi' '''
+    tb.dispatch("write_file", {"path": "weird.txt", "content": tricky + "\n"})
+    out = tb.dispatch("search_code", {"pattern": r'a"\s*\|\s*b'})
+    assert "weird.txt" in out.replace("\\", "/")
+
+
+def test_search_code_via_ripgrep_respects_max_results_without_unix_head(tmp_path):
+    """M4 regression: truncation used to rely on piping through the Unix
+    `head` command, which doesn't exist on Windows. It's now done in
+    Python after collecting ripgrep's output, so it works everywhere."""
+    import shutil
+    if shutil.which("rg") is None:
+        pytest.skip("ripgrep not installed")
+    tb, ws = make_toolbox(tmp_path)
+    content = "\n".join(f"needle {i}" for i in range(20))
+    tb.dispatch("write_file", {"path": "many.txt", "content": content})
+    out = tb.dispatch("search_code", {"pattern": "needle", "max_results": 5})
+    matched_lines = [l for l in out.splitlines() if "many.txt" in l.replace("\\", "/")]
+    assert len(matched_lines) == 5
+    assert "truncated at 5 results" in out
+
+
+def test_search_code_ripgrep_no_matches(tmp_path):
+    import shutil
+    if shutil.which("rg") is None:
+        pytest.skip("ripgrep not installed")
+    tb, ws = make_toolbox(tmp_path)
+    tb.dispatch("write_file", {"path": "a.txt", "content": "nothing relevant here\n"})
+    out = tb.dispatch("search_code", {"pattern": "definitely_not_present_xyz"})
+    assert out == "[no matches]"
+
+
+def test_read_file_caps_a_single_absurdly_long_line(tmp_path):
+    """M5 regression: a single line under the line-count limit but huge in
+    characters (minified JS, a giant JSON blob) used to be returned in
+    full -- one 'line' could still blow the model's context budget."""
+    tb, ws = make_toolbox(tmp_path)
+    huge_line = "x" * 50_000
+    tb.dispatch("write_file", {"path": "huge.txt", "content": huge_line + "\n"})
+    out = tb.dispatch("read_file", {"path": "huge.txt"})
+    assert len(out) < 10_000
+    assert "truncated" in out
+
+
+def test_read_file_caps_total_output_across_many_long_lines(tmp_path):
+    """M5 regression: many lines each individually under the per-line cap
+    can still sum to something huge -- there must be a total-size backstop
+    too, not just a per-line one."""
+    tb, ws = make_toolbox(tmp_path)
+    # 500 lines of ~1900 chars each = ~950KB, well past MAX_READ_FILE_CHARS,
+    # but each individual line is under MAX_LINE_CHARS on its own.
+    content = "\n".join("y" * 1900 for _ in range(500))
+    tb.dispatch("write_file", {"path": "many_long.txt", "content": content})
+    out = tb.dispatch("read_file", {"path": "many_long.txt", "limit": 500})
+    assert len(out) < 150_000
+    assert "output truncated" in out
+
+
+def test_read_file_normal_content_is_unaffected(tmp_path):
+    """The caps must not kick in or alter output for ordinary files."""
+    tb, ws = make_toolbox(tmp_path)
+    tb.dispatch("write_file", {"path": "a.py", "content": "line1\nline2\nline3\n"})
+    out = tb.dispatch("read_file", {"path": "a.py"})
+    assert "line1" in out and "line3" in out
+    assert "truncated" not in out
+
+
+def test_record_decision_writes_to_decisions_store(tmp_path):
+    tb, ws = make_toolbox(tmp_path)
+    out = tb.dispatch("record_decision", {"decision": "Use SQLAlchemy ORM, not raw sqlite3"})
+    assert "Recorded" in out
+    assert "SQLAlchemy" in tb.decisions.summary_text()
+
+
+def test_record_decision_uses_current_context_as_originating_step(tmp_path):
+    tb, ws = make_toolbox(tmp_path)
+    tb.current_context = "step: build the db layer"
+    tb.dispatch("record_decision", {"decision": "REST API, JSON bodies"})
+    assert tb.decisions.load()[0].originating_step == "step: build the db layer"
+
+
+def test_record_decision_supersede_reaches_the_store(tmp_path):
+    tb, ws = make_toolbox(tmp_path)
+    tb.dispatch("record_decision", {"decision": "Use raw sqlite3 directly"})
+    old_id = tb.decisions.load()[0].id
+    out = tb.dispatch("record_decision", {
+        "decision": "Use SQLAlchemy ORM, not raw sqlite3",
+        "supersedes": old_id,
+    })
+    assert "superseding" in out
+    decisions = {d.id: d for d in tb.decisions.load()}
+    assert decisions[old_id].active is False
+
+
+def test_record_decision_unknown_supersede_id_reports_it_did_not_match(tmp_path):
+    tb, ws = make_toolbox(tmp_path)
+    out = tb.dispatch("record_decision", {"decision": "something", "supersedes": "bogus"})
+    assert "did not match" in out
+
+
+def test_record_decision_requires_nonblank_decision(tmp_path):
+    tb, ws = make_toolbox(tmp_path)
+    with pytest.raises(ToolError):
+        tb.dispatch("record_decision", {"decision": ""})

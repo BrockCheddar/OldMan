@@ -125,7 +125,7 @@ def test_escalation_abort(tmp_path, monkeypatch):
     ])
 
     monkeypatch.setattr("builtins.input", lambda prompt="": "abort")
-    agent = Agent(make_config(tmp_path, max_subtask_attempts=1), llm=llm)
+    agent = Agent(make_config(tmp_path, max_subtask_attempts=1, max_replan_cycles=0), llm=llm)
 
     from autocoder.agent import AgentAborted
     import pytest
@@ -241,7 +241,7 @@ def test_failed_step_escalation_guidance_resumes_instead_of_ending_run(tmp_path,
     ])
     monkeypatch.setattr("builtins.input", lambda prompt="": "try something achievable instead")
 
-    agent = Agent(make_config(tmp_path, max_subtask_attempts=1), llm=llm)
+    agent = Agent(make_config(tmp_path, max_subtask_attempts=1, max_replan_cycles=0), llm=llm)
     state = agent.run(goal="make hello.py", resume=False,
                       final_acceptance_command="python -m py_compile hello.py")
 
@@ -486,7 +486,7 @@ def test_lesson_recorded_when_escalation_guidance_leads_to_success(tmp_path, mon
     ])
     monkeypatch.setattr("builtins.input", lambda prompt="": "use a python check instead")
 
-    agent = Agent(make_config(tmp_path, max_subtask_attempts=1), llm=llm)
+    agent = Agent(make_config(tmp_path, max_subtask_attempts=1, max_replan_cycles=0), llm=llm)
     state = agent.run(goal="make hello.py", resume=False,
                       final_acceptance_command="python -m py_compile hello.py")
 
@@ -911,8 +911,9 @@ def test_coder_receives_step_context_not_planner_history(tmp_path):
     )
 
     assert state.status == "done"
-    # calls: outer read, outer propose, inner write, inner mark, outer done
-    assert len(llm.calls) == 5
+    # calls: outer read, outer propose, inner write, inner mark, dirty-file
+    # condensation flush (hello.py was written then the step passed), outer done
+    assert len(llm.calls) == 6
     coder_call = llm.calls[2]
     assert coder_call["history_len"] == 1
     assert "Create hello.py" in coder_call["history"][0].text
@@ -1524,3 +1525,146 @@ def test_failed_mark_step_done_tells_the_model_its_edits_were_reverted(tmp_path)
     assert failure_texts, "expected at least one failed-check tool_result"
     assert any("reverted" in t for t in failure_texts)
     assert any("re-verify" in t or "no longer reflects" in t for t in failure_texts)
+
+
+# ── autonomous replan tier ──────────────────────────────────────────────────
+
+def test_replan_triggers_before_escalation_and_succeeds(tmp_path):
+    """
+    Core behavior: a step that exhausts max_subtask_attempts gets an
+    autonomous replan (mechanical -- the harness decides, not a tool call)
+    BEFORE any human escalation. If the replan produces a workable
+    revision, the run finishes with no human input at all.
+    """
+    llm = FakeLLMClient([
+        tool_response("propose_step", {
+            "title": "Impossible on first try",
+            "acceptance_command": "python -c \"import sys; sys.exit(1)\"",  # always fails
+        }),
+        tool_response("mark_step_done", {"summary": "sure"}, call_id="i1"),
+        # replan pass: planner LLM revises the step
+        text_response("OBJECTIVE: create a trivial file\nACCEPTANCE_COMMAND: python -c \"pass\""),
+        tool_response("mark_step_done", {"summary": "fixed after replan"}, call_id="i2"),
+        tool_response("declare_done", {"summary": "done"}, call_id="o1"),
+    ])
+    agent = Agent(make_config(tmp_path, max_subtask_attempts=1, max_replan_cycles=1), llm=llm)
+    state = agent.run(goal="g", resume=False, final_acceptance_command="python -c \"pass\"")
+
+    assert state.status == "done"
+    assert len(state.completed_steps) == 1
+    assert state.completed_steps[0].acceptance_command == "python -c \"pass\""
+
+    events = [json.loads(line) for line in agent.config.log_file.read_text().splitlines()]
+    assert any(e["kind"] == "replan_triggered" for e in events)
+
+
+def test_replan_cap_forces_escalation(tmp_path, monkeypatch):
+    """
+    Once replan_count reaches max_replan_cycles, the harness stops trying
+    on its own and escalates to the human -- the replan tier limits human
+    involvement, it doesn't eliminate escalation for a genuinely stuck step.
+    """
+    llm = FakeLLMClient([
+        tool_response("propose_step", {
+            "title": "Never works",
+            "acceptance_command": "python -c \"import sys; sys.exit(1)\"",
+        }),
+        tool_response("mark_step_done", {"summary": "try 1"}, call_id="i1"),
+        # replan pass returns the same (still-broken) command -- doesn't help
+        text_response("OBJECTIVE: same\nACCEPTANCE_COMMAND: python -c \"import sys; sys.exit(1)\""),
+        tool_response("mark_step_done", {"summary": "try 2"}, call_id="i2"),
+    ])
+    monkeypatch.setattr("builtins.input", lambda prompt="": "abort")
+    agent = Agent(make_config(tmp_path, max_subtask_attempts=1, max_replan_cycles=1), llm=llm)
+
+    from autocoder.agent import AgentAborted
+    import pytest
+    with pytest.raises(AgentAborted):
+        agent.run(goal="g", resume=False)
+
+    events = [json.loads(line) for line in agent.config.log_file.read_text().splitlines()]
+    replan_events = [e for e in events if e["kind"] == "replan_triggered"]
+    assert len(replan_events) == 1  # replanned once, then escalated -- cap respected
+
+
+def test_revise_acceptance_command_cap_resets_each_replan_cycle(tmp_path):
+    """
+    revise_acceptance_command's one-use cap is per REPLAN CYCLE, not per
+    step lifetime: a revision used before a replan must not block a second
+    revision used after that replan.
+    """
+    llm = FakeLLMClient([
+        tool_response("propose_step", {
+            "title": "Broken check, revised twice across a replan",
+            "acceptance_command": "python -c \"import sys; sys.exit(1)\"",
+        }),
+        tool_response("revise_acceptance_command", {
+            "new_acceptance_command": "python -c \"raise SystemExit(1)\"",
+            "reason": "first revision, still deliberately fails",
+        }, call_id="i1"),
+        tool_response("mark_step_done", {"summary": "try"}, call_id="i2"),
+        # exhausted at max_subtask_attempts=1 -> replan, keeps the same command
+        text_response("OBJECTIVE: same\nACCEPTANCE_COMMAND: python -c \"raise SystemExit(1)\""),
+        # this revision must NOT be rejected -- revisions_this_cycle reset to 0
+        tool_response("revise_acceptance_command", {
+            "new_acceptance_command": "python -c \"pass\"",
+            "reason": "second revision, allowed in the new cycle",
+        }, call_id="i3"),
+        tool_response("mark_step_done", {"summary": "fixed"}, call_id="i4"),
+        tool_response("declare_done", {"summary": "done"}, call_id="o1"),
+    ])
+    agent = Agent(make_config(tmp_path, max_subtask_attempts=1, max_replan_cycles=1), llm=llm)
+    state = agent.run(goal="g", resume=False, final_acceptance_command="python -c \"pass\"")
+
+    assert state.status == "done"
+    assert state.completed_steps[0].acceptance_command == "python -c \"pass\""
+
+    tool_result_texts = []
+    for c in llm.calls:
+        for t in c["history"]:
+            if t.role == "tool_results":
+                tool_result_texts.extend(r.content for r in t.tool_results)
+    assert not any("already been revised" in t for t in tool_result_texts)
+
+
+def test_resume_gives_a_fresh_replan_budget_for_the_next_step(tmp_path):
+    """
+    replan_count/revisions_this_cycle live on the ephemeral StepContext,
+    never on RunState -- consistent with session.py's existing invariant
+    that a crash loses at most one in-progress step. A step proposed after
+    resume gets the FULL max_replan_cycles again; nothing about a prior
+    (even crashed) step's replan usage carries over, since it was never
+    persisted in the first place.
+    """
+    cfg = make_config(tmp_path, max_subtask_attempts=1, max_replan_cycles=1)
+
+    llm1 = FakeLLMClient([
+        tool_response("propose_step", {
+            "title": "Step 1", "acceptance_command": "python -c \"pass\"",
+        }),
+        tool_response("mark_step_done", {"summary": "done"}, call_id="i1"),
+        KeyboardInterrupt(),  # simulate the run being interrupted right after step 1
+    ])
+    agent1 = Agent(cfg, llm=llm1)
+    state = agent1.run(goal="g", resume=False)
+    assert state.status == "running"  # interrupted, not done -- exactly what "resume" is for
+    assert len(state.completed_steps) == 1
+
+    # Fresh Agent + fresh LLM client against the SAME session dir --
+    # standin for a resumed process. Step 2 exhausts its attempt, gets a
+    # full replan cycle, then succeeds.
+    llm2 = FakeLLMClient([
+        tool_response("propose_step", {
+            "title": "Step 2, fails once",
+            "acceptance_command": "python -c \"import sys; sys.exit(1)\"",
+        }),
+        tool_response("mark_step_done", {"summary": "try"}, call_id="i2"),
+        text_response("OBJECTIVE: fixed\nACCEPTANCE_COMMAND: python -c \"pass\""),
+        tool_response("mark_step_done", {"summary": "fixed"}, call_id="i3"),
+        tool_response("declare_done", {"summary": "done"}, call_id="o1"),
+    ])
+    agent2 = Agent(cfg, llm=llm2)
+    state2 = agent2.run(goal=None, resume=True, final_acceptance_command="python -c \"pass\"")
+
+    assert state2.status == "done"
+    assert len(state2.completed_steps) == 2

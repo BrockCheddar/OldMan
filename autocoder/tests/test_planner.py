@@ -2,7 +2,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from autocoder.planner import RunState, CompletedStep
+from autocoder.planner import RunState, CompletedStep, StepContext
 
 
 def test_initial_state():
@@ -40,3 +40,18 @@ def test_roundtrip_serialisation():
 def test_status_roundtrip():
     s = RunState(goal="g", status="done")
     assert RunState.from_dict(s.to_dict()).status == "done"
+
+
+def test_step_context_prompt_text_omits_baseline_when_unset():
+    ctx = StepContext(title="t", objective="o", acceptance_command="true")
+    assert "BASELINE" not in ctx.prompt_text()
+
+
+def test_step_context_prompt_text_includes_baseline_when_set():
+    ctx = StepContext(
+        title="t", objective="o", acceptance_command="true",
+        baseline_check_result="$ true\nexit 1\nstdout:\n\nstderr:\nAttributeError: boom",
+    )
+    text = ctx.prompt_text()
+    assert "BASELINE" in text
+    assert "AttributeError: boom" in text

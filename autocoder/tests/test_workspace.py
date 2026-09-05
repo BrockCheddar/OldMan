@@ -1,4 +1,5 @@
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -95,10 +96,96 @@ def test_run_command_os_error_does_not_crash(tmp_path, monkeypatch):
     def _raise_oserror(*args, **kwargs):
         raise FileNotFoundError("[WinError 206] The filename or extension is too long")
 
-    monkeypatch.setattr(workspace_module.subprocess, "run", _raise_oserror)
+    monkeypatch.setattr(workspace_module.subprocess, "Popen", _raise_oserror)
     result = ws.run_command("some command", timeout=10)
 
     assert result.exit_code != 0
     assert not result.timed_out
     assert "FileNotFoundError" in result.stderr
     assert "too long" in result.stderr
+
+
+def test_run_command_does_not_inherit_stdin(tmp_path, monkeypatch):
+    """
+    Regression: a command that reads from stdin without us explicitly
+    redirecting it inherits our own stdin and can block forever waiting
+    for input that will never come -- confirmed in practice, and
+    indistinguishable from a slow command until you check whether it's
+    actually using any CPU (it won't be).
+    """
+    from autocoder import workspace as workspace_module
+
+    ws = Workspace.create(tmp_path / "ws", source_repo=None)
+    captured = {}
+    real_popen = workspace_module.subprocess.Popen
+
+    class _Recording(real_popen):
+        def __init__(self, *args, **kwargs):
+            captured.update(kwargs)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(workspace_module.subprocess, "Popen", _Recording)
+    ws.run_command("echo hi", timeout=10)
+    assert captured.get("stdin") is workspace_module.subprocess.DEVNULL
+
+
+def test_kill_process_tree_uses_taskkill_on_windows(monkeypatch):
+    from autocoder import workspace as workspace_module
+
+    monkeypatch.setattr(workspace_module.os, "name", "nt")
+    calls = []
+    monkeypatch.setattr(
+        workspace_module.subprocess, "run",
+        lambda *a, **kw: calls.append(a[0]),
+    )
+
+    class _FakeProc:
+        pid = 4242
+        def wait(self, timeout=None):
+            return 0
+
+    workspace_module._kill_process_tree(_FakeProc())
+    assert calls == [["taskkill", "/T", "/F", "/PID", "4242"]]
+
+
+def test_kill_process_tree_uses_process_group_on_posix(monkeypatch):
+    from autocoder import workspace as workspace_module
+
+    monkeypatch.setattr(workspace_module.os, "name", "posix")
+    killed = {}
+    monkeypatch.setattr(workspace_module.os, "getpgid", lambda pid: 999)
+    monkeypatch.setattr(workspace_module.os, "killpg", lambda pgid, sig: killed.update(pgid=pgid, sig=sig))
+
+    class _FakeProc:
+        pid = 4242
+        def wait(self, timeout=None):
+            return 0
+
+    workspace_module._kill_process_tree(_FakeProc())
+    assert killed == {"pgid": 999, "sig": workspace_module.signal.SIGKILL}
+
+
+def test_run_command_kills_full_process_tree_on_timeout(tmp_path):
+    """
+    Real regression test (not mocked): the old code's proc.kill() only
+    reached the immediate shell child. A detached grandchild that outlives
+    it and keeps holding the inherited stdout pipe open used to hang
+    communicate() forever, past whatever timeout was configured -- because
+    the pipe can't hit EOF while anything still holds it open. This must
+    return promptly regardless.
+    """
+    import platform
+    if platform.system() == "Windows":
+        import pytest as _pytest
+        _pytest.skip("POSIX-specific detached-grandchild reproduction")
+
+    ws = Workspace.create(tmp_path / "ws", source_repo=None)
+    # backgrounds a grandchild that outlives the shell that spawned it,
+    # inheriting the same stdout pipe -- the exact shape of the bug.
+    cmd = "(sleep 30 &) ; sleep 30"
+    start = time.time()
+    result = ws.run_command(cmd, timeout=1)
+    elapsed = time.time() - start
+
+    assert result.timed_out
+    assert elapsed < 10  # old code would hang for the full 30s+
