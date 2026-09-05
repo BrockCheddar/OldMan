@@ -75,8 +75,8 @@ class LLMBackendConfig:
 
 @dataclass
 class Budget:
-    max_subtask_attempts: int = 3        # acceptance-check attempts per subtask before triggering a re-plan
-    max_replan_cycles: int = 2           # re-plan cycles per subtask before forcing escalation to the human
+    max_subtask_attempts: int = 3        # acceptance-check attempts per subtask before checking for an autonomous replan
+    max_replan_cycles: int = 2           # autonomous replans of a stuck step before escalating to the human
     max_steps_per_attempt: int = 40      # tool-call turns before an attempt is abandoned
     max_output_tokens: int = 8000        # per single model turn
     max_wall_clock_seconds: int = 21600  # 6h soft cap for a whole run -- warns, does not kill. Local inference is slower; size accordingly.

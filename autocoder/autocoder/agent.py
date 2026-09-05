@@ -324,7 +324,7 @@ UPDATE_SCRATCHPAD_TOOL = {
 # through propose_step -> the inner loop, where mark_step_done actually
 # re-verifies the result.
 _OUTER_SAFE_TOOL_NAMES = {
-    "read_file", "list_dir", "search_code", "run_command", "git_diff", "git_log",
+    "read_file", "code_skeleton", "list_dir", "search_code", "run_command", "git_diff", "git_log",
     "ask_human", "record_decision",
 }
 OUTER_WORKSPACE_TOOLS = [t for t in TOOL_SCHEMAS if t["name"] in _OUTER_SAFE_TOOL_NAMES]
@@ -347,6 +347,15 @@ class Agent:
         )
         self.session = SessionStore(config)
         self.llm = llm if llm is not None else build_llm_client(config.llm)
+        # Only actually builds a second client if planner_llm is configured
+        # separately; the normal case (one local model) resolves to the
+        # same backend/config as self.llm, called sequentially like every
+        # other request -- see LLMBackendConfig docstring on why nothing
+        # here is allowed to run concurrently against a single-slot server.
+        self.planner_llm = (
+            self.llm if config.planner_llm is None
+            else build_llm_client(config.planner_llm)
+        )
         self.budget = BudgetTracker(config.budget)
         self.toolbox = ToolBox(self.workspace, config, on_pause=self.budget.pause, on_resume=self.budget.resume)
         self.lessons = LessonsStore(config.lessons_file)
@@ -504,8 +513,6 @@ class Agent:
             self.session.log_event("condensation_parse_failed", {"files": sorted(touched_files)})
             return
         self.session.log_event("condensation_pass", {"files": sorted(touched_files), "applied": applied})
-        self.session.save_state(state)
-        self.session.log_event("condensation_pass", {"files": sorted(touched_files)})
         self.session.save_state(state)
 
     def _call_llm(self, state: RunState, system: str, history: list[Turn], tools: list[dict]):
@@ -1066,11 +1073,11 @@ class Agent:
                                 "were already given and ignored"
                             )
                     tool_results.append(ToolResult(tool_call_id=call.id, content=output))
-                    if call.name in ("read_file", "search_code"):
+                    if call.name in ("read_file", "code_skeleton", "search_code"):
                         target = call.input.get("path") or call.input.get("query") or ""
                         exploration_log.append((f"{call.name}({target})", output))
                         self._append_auto_read_note(state, call.name, target, output)
-                        if call.name == "read_file" and target:
+                        if call.name in ("read_file", "code_skeleton") and target:
                             files_since_condense.add(target)
                             if len(files_since_condense) >= condense_batch_size:
                                 self._condense_batch(state, files_since_condense, exploration_log)
@@ -1216,6 +1223,78 @@ class Agent:
             )
         return header
 
+    def _try_replan(self, state: RunState, step_context: StepContext,
+                     failure_reason: str, last_failure_detail: str) -> bool:
+        """
+        Mechanical switch, not a tool call the model chooses: fires only
+        when a step has exhausted max_subtask_attempts. Exists to limit
+        human involvement in a FAILED RESPONSE -- a step that's stuck --
+        as distinct from a genuine blocker, which still escalates.
+
+        Returns True if a replan happened (step_context has been revised
+        in place and the caller should reset its attempt counters and
+        keep going), or False once max_replan_cycles is exhausted or the
+        planner call itself failed, meaning the caller must escalate.
+        """
+        if step_context.replan_count >= self.config.budget.max_replan_cycles:
+            return False
+
+        prompt = (
+            f"STEP: {step_context.title}\n"
+            f"CURRENT OBJECTIVE:\n{step_context.objective}\n\n"
+            f"CURRENT ACCEPTANCE COMMAND:\n  {step_context.acceptance_command}\n\n"
+            f"This step exhausted {self.config.budget.max_subtask_attempts} attempts "
+            f"without passing.\n{failure_reason}\n\n"
+            f"LAST FAILURE DETAIL:\n{last_failure_detail or '(none recorded)'}\n\n"
+            f"SCRATCHPAD:\n{state.scratchpad or '(empty)'}\n\n"
+            "Decide whether the OBJECTIVE or ACCEPTANCE COMMAND itself was wrong given "
+            "this evidence, and produce a corrected version a coder can actually complete. "
+            "Keep the same scope -- narrow or fix it, don't expand it into new work.\n\n"
+            "Respond with EXACTLY two lines, nothing else:\n"
+            "OBJECTIVE: <revised objective, or the same text if it was fine>\n"
+            "ACCEPTANCE_COMMAND: <revised command, or the same command if it was fine>"
+        )
+        try:
+            response = self.planner_llm.complete(
+                system=(
+                    "You are the replanning pass for a stuck autonomous coding step. "
+                    "You do not write code -- you only decide whether the step's "
+                    "definition was wrong and correct it."
+                ),
+                history=[Turn(role="user", text=prompt)],
+                tools=[],
+                max_tokens=self.config.budget.max_output_tokens,
+            )
+        except LLMError as e:
+            self.session.log_event("replan_llm_error", {"title": step_context.title, "error": str(e)})
+            return False  # can't reach the planner -- don't fake a cycle, just escalate
+
+        step_context.replan_count += 1
+        step_context.revisions_this_cycle = 0
+        new_objective, new_cmd = _parse_replan_response(response.text or "")
+        if new_objective:
+            step_context.objective = new_objective
+        if new_cmd:
+            problem = _validate_acceptance_command(new_cmd)
+            if problem:
+                self.session.log_event("replan_acceptance_command_rejected", {
+                    "title": step_context.title, "reason": problem, "command": new_cmd,
+                })
+            elif new_cmd != step_context.acceptance_command:
+                step_context.acceptance_command = new_cmd
+                step_context.baseline_check_result = self._run_baseline_check(step_context)
+
+        print(f"    [replan] cycle {step_context.replan_count}/{self.config.budget.max_replan_cycles} "
+              f"for '{step_context.title}'")
+        self.session.log_event("replan_triggered", {
+            "title": step_context.title,
+            "replan_count": step_context.replan_count,
+            "reason": failure_reason,
+            "new_objective": new_objective,
+            "new_acceptance_command": new_cmd,
+        })
+        return True
+
     def _inner_loop(
         self,
         state: RunState,
@@ -1263,7 +1342,27 @@ class Agent:
         # over-inclusive set only costs an extra read, never a wrong note.
         dirty_files: set[str] = set()
 
-        while attempts < self.config.budget.max_subtask_attempts:
+        while True:
+            if attempts >= self.config.budget.max_subtask_attempts:
+                # MECHANICAL switch, not a tool the model calls: the harness
+                # itself decides whether to retry autonomously (replan) or
+                # give up and page a human (escalate). This exists to limit
+                # human involvement in a FAILED RESPONSE -- a step that's
+                # stuck -- as distinct from a genuine blocker; see
+                # _try_replan for what "stuck" gets one more shot at.
+                failure_reason = _inner_loop_failure_reason(step_context.title, check_failures, derailed_attempts)
+                if self._try_replan(state, step_context, failure_reason, last_failure_detail):
+                    attempts = 0
+                    check_failures = 0
+                    derailed_attempts = 0
+                    last_attempt_note = (
+                        f"This step was autonomously replanned (cycle {step_context.replan_count}/"
+                        f"{self.config.budget.max_replan_cycles}) after exhausting its attempts. "
+                        "Work toward the objective and acceptance_command below -- they may have "
+                        "been revised based on why the previous attempts failed."
+                    )
+                    continue
+                return None, failure_reason
             self.budget.new_attempt()
             # Clean slate: discard whatever the previous attempt (if any)
             # left behind. Without this, a failed attempt's half-finished
@@ -1350,10 +1449,10 @@ class Agent:
                         target = call.input.get("path") or ""
                         if target:
                             dirty_files.add(target)
-                    if call.name in ("read_file", "search_code") and not tool_results[-1].is_error:
+                    if call.name in ("read_file", "code_skeleton", "search_code") and not tool_results[-1].is_error:
                         target = call.input.get("path") or call.input.get("query") or ""
                         inner_exploration_log.append((f"{call.name}({target})", tool_results[-1].content))
-                        if call.name == "read_file" and target:
+                        if call.name in ("read_file", "code_skeleton") and target:
                             inner_files_since_condense.add(target)
                             if len(inner_files_since_condense) >= condense_batch_size:
                                 self._condense_batch(state, inner_files_since_condense, inner_exploration_log)
@@ -1391,12 +1490,12 @@ class Agent:
                     # legitimate (see REVISE_ACCEPTANCE_COMMAND_TOOL's
                     # description for why that judgment isn't the harness's
                     # to make), just a bound on how far this can go unseen.
-                    if step_context.acceptance_command_revisions >= 1:
+                    if step_context.revisions_this_cycle >= 1:
                         tool_results.append(ToolResult(
                             tool_call_id=revise_call.id, is_error=True,
                             content=(
-                                "acceptance_command has already been revised once for this "
-                                "step -- that's the limit. Keep working against the current "
+                                "acceptance_command has already been revised once this "
+                                "cycle -- that's the limit. Keep working against the current "
                                 "acceptance_command, or call discard_and_restart if the "
                                 "APPROACH needs to change, not the check."
                             ),
@@ -1425,6 +1524,7 @@ class Agent:
                             old_cmd = step_context.acceptance_command
                             step_context.acceptance_command = new_cmd
                             step_context.acceptance_command_revisions += 1
+                            step_context.revisions_this_cycle += 1
                             print(f"    [revise] acceptance_command for '{step_context.title}': {reason[:200]}")
                             self.session.log_event("acceptance_command_revised", {
                                 "title": step_context.title, "old_command": old_cmd,
@@ -1514,7 +1614,7 @@ class Agent:
                     # so this is the actual retry point that needs the revert.
                     self.workspace.git_revert_to_last_commit()
                     if attempts >= self.config.budget.max_subtask_attempts:
-                        return None, _inner_loop_failure_reason(step_context.title, check_failures, derailed_attempts)
+                        break  # top of the outer loop decides: replan or escalate
 
                     tool_results.append(ToolResult(
                         tool_call_id=mark_call.id, is_error=True,
@@ -1542,8 +1642,6 @@ class Agent:
                         )
                         history = compact_history_with_state_report(history, report)
                         self.session.log_event("state_report_compaction", {"title": step_context.title})
-
-        return None, _inner_loop_failure_reason(step_context.title, check_failures, derailed_attempts)
 
     # ── done verification ──────────────────────────────────────────────────
 
@@ -1961,6 +2059,30 @@ def _validate_python_dash_c_syntax(acceptance_cmd: str) -> str | None:
             f"{' (and the others)' if len(missing) > 1 else ''} at the start of the -c code."
         )
     return None
+
+
+def _parse_replan_response(text: str) -> tuple[str, str]:
+    """Parses the replan pass's `OBJECTIVE: ...` / `ACCEPTANCE_COMMAND: ...`
+    two-line format. Tolerant of a small local model wrapping either value
+    across multiple lines (everything up to the next recognized label is
+    folded into the current one) -- but the labels themselves must appear
+    at line start, same tolerance level as _parse_condensed_sections.
+    Returns ('', '') for either field the response didn't include, so the
+    caller can tell 'no change' apart from 'this replan produced nothing
+    usable' without guessing."""
+    objective_lines: list[str] = []
+    command_lines: list[str] = []
+    current: list[str] | None = None
+    for line in text.splitlines():
+        if line.upper().startswith("OBJECTIVE:"):
+            current = objective_lines
+            current.append(line.split(":", 1)[1].strip())
+        elif line.upper().startswith("ACCEPTANCE_COMMAND:"):
+            current = command_lines
+            current.append(line.split(":", 1)[1].strip())
+        elif current is not None:
+            current.append(line)
+    return "\n".join(objective_lines).strip(), "\n".join(command_lines).strip()
 
 
 def _inner_loop_failure_reason(title: str, check_failures: int, derailed_attempts: int) -> str:

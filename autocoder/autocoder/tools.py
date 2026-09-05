@@ -8,6 +8,7 @@ to regex guessing.
 """
 from __future__ import annotations
 
+import ast
 import fnmatch
 import os
 import platform
@@ -199,6 +200,27 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "code_skeleton",
+        "description": (
+            "Structure of a Python file WITHOUT its implementation: module docstring, imports, "
+            "and every top-level function/class signature (args, type hints, defaults, return "
+            "type, line number, first line of docstring) -- no function/method bodies. "
+            "Deterministic (parsed, not generated) -- typically 90%+ smaller than the full file, "
+            "so use this FIRST on an unfamiliar or large Python file, before read_file. Once you "
+            "know which function/class you actually need, follow up with a targeted "
+            "read_file(path, offset=<line from here>, limit=...) instead of reading the whole "
+            "file. Python only -- fails with a clear error on anything that isn't valid Python "
+            "source; use read_file for non-Python files."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Path relative to the workspace root."},
+            },
+            "required": ["path"],
+        },
+    },
+    {
         "name": "write_file",
         "description": (
             "Create a NEW file, or COMPLETELY REPLACE an existing one's entire contents. "
@@ -340,6 +362,85 @@ class ToolError(RuntimeError):
     to the model as a tool_result error so it can repair its own call."""
 
 
+def _skeleton_decorators(node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) -> str:
+    """Renders each decorator on its own line, e.g. '@property' or
+    '@app.route(\"/x\")'. Omitted decorators (property, staticmethod,
+    abstractmethod, overload, dataclass, etc.) change how a member is
+    called or constructed -- a skeleton that hid them would look like a
+    plain callable/class and mislead the model into calling it wrong."""
+    if not node.decorator_list:
+        return ""
+    return "".join(f"@{ast.unparse(d)}\n" for d in node.decorator_list)
+
+
+def _skeleton_signature(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
+    """Renders one function/method's signature line: name, args (with type
+    hints and defaults where present), return type, line number, and the
+    first line of its docstring if it has one. Never renders the body --
+    that's the entire point of a skeleton."""
+    args = []
+    a = fn.args
+    defaults = [None] * (len(a.args) - len(a.defaults)) + list(a.defaults)
+    for arg, default in zip(a.args, defaults):
+        ann = f": {ast.unparse(arg.annotation)}" if arg.annotation else ""
+        dflt = f" = {ast.unparse(default)}" if default is not None else ""
+        args.append(f"{arg.arg}{ann}{dflt}")
+    if a.vararg:
+        args.append(f"*{a.vararg.arg}")
+    if a.kwarg:
+        args.append(f"**{a.kwarg.arg}")
+    ret = f" -> {ast.unparse(fn.returns)}" if fn.returns else ""
+    doc = ast.get_docstring(fn, clean=True)
+    doc_str = f'  # "{doc.splitlines()[0][:80]}"' if doc else ""
+    prefix = "async def" if isinstance(fn, ast.AsyncFunctionDef) else "def"
+    return f"{_skeleton_decorators(fn)}{prefix} {fn.name}({', '.join(args)}){ret}  (line {fn.lineno}){doc_str}"
+
+
+def _render_code_skeleton(tree: ast.Module) -> str:
+    """Module docstring + imports + every top-level function/class
+    signature (methods included, bodies never included). Deterministic --
+    same input always produces the same output, nothing here is generated
+    by a model, so there's no hallucination or truncation-artifact risk in
+    what this reports; it can only be as correct as the source it's
+    reading, same as any parser."""
+    lines: list[str] = []
+    mod_doc = ast.get_docstring(tree, clean=True)
+    if mod_doc:
+        lines.append(f'"""{mod_doc.splitlines()[0]}"""')
+
+    imports = []
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            imports.append(", ".join(a.name for a in node.names))
+        elif isinstance(node, ast.ImportFrom):
+            mod = "." * (node.level or 0) + (node.module or "")
+            imports.append(f"{mod} ({', '.join(a.name for a in node.names)})")
+    if imports:
+        lines.append("imports: " + "; ".join(imports))
+    if lines:
+        lines.append("")
+
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            lines.append(_skeleton_signature(node))
+        elif isinstance(node, ast.ClassDef):
+            bases = ", ".join(ast.unparse(b) for b in node.bases)
+            doc = ast.get_docstring(node, clean=True)
+            doc_str = f'  # "{doc.splitlines()[0][:80]}"' if doc else ""
+            lines.append(f"{_skeleton_decorators(node)}class {node.name}({bases})  (line {node.lineno}){doc_str}")
+            for item in node.body:
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    # Indent every line of the signature block, not just the
+                    # first -- a decorated method's _skeleton_signature is
+                    # multi-line (one '@...' line per decorator), and an
+                    # unindented decorator line would visually detach from
+                    # the method it belongs to.
+                    for sig_line in _skeleton_signature(item).splitlines():
+                        lines.append(f"    {sig_line}")
+            lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
 class ToolBox:
     def __init__(self, workspace: Workspace, config: Config,
                  on_command_needs_approval: Callable[[str, ApprovalDecision], bool] | None = None,
@@ -443,6 +544,47 @@ class ToolBox:
             numbered = numbered[:self.MAX_READ_FILE_CHARS] + "\n...[output truncated, use offset/limit to page further]"
         footer = f"\n[showing lines {start+1}-{start+len(chunk)} of {total}]"
         return (numbered or "[empty file]") + footer
+
+    # Same defensive shape as read_file's caps -- a pathological input
+    # (deeply nested classes, thousands of one-liner functions) could still
+    # in principle produce a large skeleton even though the whole point is
+    # that skeletons are normally a small fraction of the source size.
+    MAX_SKELETON_CHARS = 20_000
+
+    def _tool_code_skeleton(self, inp: dict[str, Any]) -> str:
+        """Deterministic, ast-based structure extraction -- module
+        docstring, imports, and every top-level function/class signature
+        (with type hints, defaults, return type, line number, and first
+        line of docstring), no bodies. Zero LLM involvement: nothing here
+        can hallucinate, and there's nothing to truncate-mid-word the way
+        an LLM-written condensed note can, because the source of truth is
+        the AST itself, not a generated summary of it.
+
+        Python-only by construction (uses the `ast` module) -- deliberately
+        not attempting a language-agnostic approach; a file that isn't
+        valid Python gets a clear error telling the model to fall back to
+        read_file, never a crash."""
+        path = self._require_str(inp, "path")
+        target = self._resolve(path)
+        if not target.exists():
+            raise ToolError(f"file does not exist: {path}")
+        if not target.is_file():
+            raise ToolError(f"not a file: {path}")
+        source = target.read_text(encoding="utf-8", errors="replace")
+        try:
+            tree = ast.parse(source, filename=path)
+        except SyntaxError as e:
+            raise ToolError(
+                f"could not parse {path} as Python (SyntaxError: {e}) -- "
+                "use read_file instead; code_skeleton only works on valid Python source."
+            )
+        rendered = _render_code_skeleton(tree)
+        if not rendered.strip():
+            return "[no module docstring, imports, or top-level defs found -- file may be empty or data-only]"
+        if len(rendered) > self.MAX_SKELETON_CHARS:
+            rendered = rendered[:self.MAX_SKELETON_CHARS] + \
+                "\n...[skeleton truncated -- this file is unusually large even in skeleton form]"
+        return rendered
 
     def _tool_write_file(self, inp: dict[str, Any]) -> str:
         path = self._require_str(inp, "path")

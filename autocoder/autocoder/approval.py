@@ -33,8 +33,13 @@ _CD_SEGMENT_RE = re.compile(r"^cd(?:\s+/d)?\s+\S+$", re.IGNORECASE)
 # exploration on the exact platform this tool mainly targets. It exists to
 # catch the common, non-adversarial case (a model wandering with `cd ..` or
 # an absolute path), not to withstand something actively trying to escape.
+# The drive-letter pattern requires a boundary character right before the
+# letter (same reasoning as the ".." pattern above) -- without it, this
+# matched the "s:/" inside "https://" and the "p:/" inside "http://",
+# forcing a confirmation prompt (even under "auto" mode) on any ordinary
+# command with a URL in it: `curl https://...`, `git clone https://...`.
 _DOTDOT_TRAVERSAL_RE = re.compile(r"(?:^|[\s\"'=(])\.\.(?:[\\/]|$|[\s\"')])")
-_WINDOWS_DRIVE_ABS_RE = re.compile(r"[A-Za-z]:[\\/]")
+_WINDOWS_DRIVE_ABS_RE = re.compile(r"(?:^|[\s\"'=(])[A-Za-z]:[\\/]")
 _HOME_DIR_RE = re.compile(r"(?:^|\s)~(?:[\\/]|$)")
 
 

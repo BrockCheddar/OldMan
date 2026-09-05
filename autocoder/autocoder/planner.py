@@ -60,6 +60,15 @@ class StepContext:
     # before any revision can happen. See revise_acceptance_command.
     original_acceptance_command: str = ""
     acceptance_command_revisions: int = 0
+    # Autonomous replan cycles used by this step so far (see Agent._replan_step).
+    # A fail (max_subtask_attempts exhausted) checks this against
+    # budget.max_replan_cycles before escalating to a human.
+    replan_count: int = 0
+    # revise_acceptance_command's cap is per-REPLAN-CYCLE, not per-step
+    # lifetime: reset to 0 every time a replan happens, so an autonomous
+    # replan that also needs to fix a provably-wrong check doesn't collide
+    # with (or get blocked by) the step's original one-time allowance.
+    revisions_this_cycle: int = 0
 
     def prompt_text(self) -> str:
         files = "\n".join(f"  - {p}" for p in self.files) or "  (none specified -- locate as needed)"
