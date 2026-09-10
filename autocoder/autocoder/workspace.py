@@ -274,6 +274,17 @@ class Workspace:
     def git_log(self, n: int = 10) -> CommandResult:
         return self._git(["log", f"-{n}", "--oneline"])
 
+    def git_head(self) -> str | None:
+        """Current commit hash, or None if there's no commit yet (fresh
+        repo before the first commit). Used by export/import (FLAW 10) to
+        warn when a session bundle is being imported into a workspace
+        whose code doesn't match what the session's completed_steps were
+        actually verified against."""
+        result = self._git(["rev-parse", "HEAD"])
+        if result.exit_code != 0:
+            return None
+        return result.stdout.strip()
+
     def git_commit_all(self, message: str) -> CommandResult:
         self._git(["add", "-A"])
         return self._git(["commit", "-m", message, "--allow-empty-message", "--allow-empty"])

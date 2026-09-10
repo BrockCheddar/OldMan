@@ -18,7 +18,7 @@ from typing import Any, Callable
 
 from .approval import (
     ApprovalDecision, classify_command, confirm_with_human, ask_human_question,
-    detect_workspace_escape, split_command_segments,
+    detect_workspace_escape, detect_state_directory_wipe_risk, split_command_segments,
 )
 from .config import Config
 from .decisions import DecisionsStore
@@ -445,7 +445,9 @@ class ToolBox:
     def __init__(self, workspace: Workspace, config: Config,
                  on_command_needs_approval: Callable[[str, ApprovalDecision], bool] | None = None,
                  on_pause: Callable[[], None] | None = None,
-                 on_resume: Callable[[], None] | None = None):
+                 on_resume: Callable[[], None] | None = None,
+                 on_question_asked: Callable[[str], None] | None = None,
+                 on_question_answered: Callable[[], None] | None = None):
         self.ws = workspace
         self.config = config
         # Overridable hook so tests/CLIs can supply their own approval UI.
@@ -454,6 +456,16 @@ class ToolBox:
         # human isn't counted as the agent "running" (see budget.py).
         self._on_pause = on_pause
         self._on_resume = on_resume
+        # FLAW 7: called immediately before/after the blocking input() in
+        # _tool_ask_human, so the question is persisted to durable session
+        # state BEFORE the harness blocks waiting for an answer -- a crash
+        # while blocked on input() used to lose the fact a question was
+        # ever asked, since nothing was written to disk until the (never
+        # arriving) answer came back. Same on_pause/on_resume shape
+        # deliberately, for the same reason: settable per-run by whoever
+        # holds the RunState, not baked in at construction time.
+        self._on_question_asked = on_question_asked
+        self._on_question_answered = on_question_answered
         # record_decision is dispatched identically from the outer and inner
         # loops (see agent.py) via this single shared store -- there is
         # deliberately no per-loop handler to keep in sync.
@@ -726,6 +738,12 @@ class ToolBox:
             decision = ApprovalDecision(
                 True, f"command {escape_reason} -- may reach outside the workspace"
             )
+        wipe_reason = detect_state_directory_wipe_risk(command)
+        if wipe_reason:
+            # Same override, same reasoning, different risk: this doesn't
+            # leave the workspace, it erases the harness's own memory of
+            # the run from inside it. See detect_state_directory_wipe_risk.
+            decision = ApprovalDecision(True, wipe_reason)
         approved = True
         if decision.needs_confirmation:
             if self._confirm_hook is not None:
@@ -761,7 +779,12 @@ class ToolBox:
 
     def _tool_ask_human(self, inp: dict[str, Any]) -> str:
         question = self._require_str(inp, "question")
-        return self._blocking_input(lambda: ask_human_question(question))
+        if self._on_question_asked:
+            self._on_question_asked(question)
+        answer = self._blocking_input(lambda: ask_human_question(question))
+        if self._on_question_answered:
+            self._on_question_answered()
+        return answer
 
     def _tool_record_decision(self, inp: dict[str, Any]) -> str:
         decision = self._require_str(inp, "decision")

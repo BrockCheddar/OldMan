@@ -58,6 +58,30 @@ def detect_workspace_escape(command: str) -> str | None:
     return None
 
 
+# `git clean` with any flag combination containing "x" (as opposed to just
+# "f"/"d") removes files matched by .gitignore too -- and .autocoder/ (this
+# harness's own session state: session.json, events.jsonl, lessons.json,
+# decisions.json) is gitignored by Workspace._ensure_gitignore() specifically
+# so ordinary git operations leave it alone. "-x" defeats that on purpose,
+# which is normal, legitimate git usage in general -- but here it means the
+# model can silently erase the mechanism that lets a run recover from its
+# own mistakes, mid-run, with no warning. Session writes now recreate the
+# directory rather than crashing (see session.py), but a run that loses its
+# own completed-steps history, lessons, and decisions this way is still a
+# real loss even if the process survives it.
+_GIT_CLEAN_WITH_IGNORED_RE = re.compile(r"(?:^|[;&|]|\s)git\s+clean\s+[^\n;&|]*-\w*x", re.IGNORECASE)
+
+
+def detect_state_directory_wipe_risk(command: str) -> str | None:
+    """Mode-independent, same override pattern as detect_workspace_escape
+    and for the same reason: this is a self-inflicted-wound risk at least
+    as fundamental as leaving the workspace boundary, so "auto" mode
+    shouldn't get to skip past it silently either."""
+    if _GIT_CLEAN_WITH_IGNORED_RE.search(command):
+        return "runs 'git clean' with a flag that also removes gitignored files (including this run's own .autocoder/ session state)"
+    return None
+
+
 # Two-character operators must be checked before their single-character
 # component (e.g. "&&" before "&", "||" before "|") so a compound operator
 # isn't split in the middle.

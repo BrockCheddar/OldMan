@@ -82,6 +82,13 @@ class Budget:
     max_wall_clock_seconds: int = 21600  # 6h soft cap for a whole run -- warns, does not kill. Local inference is slower; size accordingly.
     max_total_tokens: int | None = None  # None = unlimited
     default_command_timeout: int = 300   # seconds, used when the model doesn't specify one for run_command
+    # FLAW 8/14: every N completed steps, pause and run a dedicated
+    # "take stock" pass (a planner_llm call, not offered to the model as a
+    # tool) that checks the run is still solving the right problem and
+    # distills the step log into a fresh scratchpad note, instead of
+    # scratchpad drift being purely up to whether the model happens to
+    # keep it current. 0 disables it entirely.
+    self_audit_every_n_steps: int = 6
 
 
 @dataclass

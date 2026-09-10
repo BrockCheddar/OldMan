@@ -23,17 +23,20 @@ Every LLM call is synchronous. Exactly one request is in flight at a time.
 from __future__ import annotations
 
 import ast
+import json
 import os
 import re
 import sys
+import time
+from pathlib import Path
 
 from .approval import ask_human_question
 from .budget import BudgetTracker, BudgetExceeded
 from .config import Config
-from .lessons import LessonsStore
+from .lessons import LessonsStore, _keywords
 from .llm import build_llm_client, LLMError, Turn, ToolResult, trim_history_to_fit
 from .osinfo import shell_description
-from .planner import RunState, CompletedStep, StepContext
+from .planner import RunState, CompletedStep, StepContext, MAX_SUBTASKS
 from .repetition import RepetitionGuard
 from .session import SessionStore
 from .state_report import compact_history_with_state_report
@@ -302,6 +305,76 @@ DECLARE_DONE_TOOL = {
     },
 }
 
+SET_GOAL_DECOMPOSITION_TOOL = {
+    "name": "set_goal_decomposition",
+    "description": (
+        "Replace the durable breakdown of the goal into distinct parts, if the "
+        "goal has more than one genuinely separate piece worth tracking (e.g. "
+        "'add feature X, then update the docs, then add tests' -- three parts). "
+        "Skip this entirely for a goal that's already one focused piece of work. "
+        "This is a FULL REPLACE, not an append -- pass every part you still want "
+        "tracked, including ones already done (use check_off_subtask for those "
+        "instead of dropping them here). If a title here matches an existing "
+        "entry's title EXACTLY, it keeps its done/pending status; a reworded "
+        "title is treated as a new item starting at pending, and any old item "
+        "you don't include at all is dropped from tracking entirely -- so if "
+        "you're only adding one new part, copy the existing titles verbatim."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "subtasks": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": f"Short titles, one per distinct part of the goal. Max {MAX_SUBTASKS}.",
+            },
+        },
+        "required": ["subtasks"],
+    },
+}
+
+STRENGTHEN_STEP_CHECK_TOOL = {
+    "name": "strengthen_step_check",
+    "description": (
+        "Add an ADDITIONAL acceptance command to an already-completed step, "
+        "when you've discovered that step's original check only proved a "
+        "narrower property than what later work now depends on (e.g. a "
+        "function's original check only covered typical input, and a later "
+        "step now relies on it handling an edge case too). Does not replace "
+        "the original command -- both are re-run by the regression check "
+        "from now on. Use this to make a real gap in verification durable, "
+        "not to duplicate a check that already covers the case."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "step_index": {"type": "integer", "description": "The [index] of the completed step, as shown in COMPLETED STEPS SO FAR."},
+            "additional_command": {
+                "type": "string",
+                "description": "Real shell command, must exit 0 on success -- same rules as any acceptance_command.",
+            },
+            "reason": {"type": "string", "description": "What gap this closes, concretely."},
+        },
+        "required": ["step_index", "additional_command", "reason"],
+    },
+}
+
+CHECK_OFF_SUBTASK_TOOL = {
+    "name": "check_off_subtask",
+    "description": (
+        "Mark one entry from the goal decomposition as done, by its id (shown "
+        "in parentheses next to each entry). Does not affect anything else in "
+        "the breakdown."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "id": {"type": "string", "description": "The subtask's id, e.g. 'a1b2c3d4'."},
+        },
+        "required": ["id"],
+    },
+}
+
 UPDATE_SCRATCHPAD_TOOL = {
     "name": "update_scratchpad",
     "description": "Update your working notes without marking any step done.",
@@ -328,7 +401,10 @@ _OUTER_SAFE_TOOL_NAMES = {
     "ask_human", "record_decision",
 }
 OUTER_WORKSPACE_TOOLS = [t for t in TOOL_SCHEMAS if t["name"] in _OUTER_SAFE_TOOL_NAMES]
-OUTER_TOOLS = OUTER_WORKSPACE_TOOLS + [PROPOSE_STEP_TOOL, DECLARE_DONE_TOOL, UPDATE_SCRATCHPAD_TOOL]
+OUTER_TOOLS = OUTER_WORKSPACE_TOOLS + [
+    PROPOSE_STEP_TOOL, DECLARE_DONE_TOOL, UPDATE_SCRATCHPAD_TOOL,
+    SET_GOAL_DECOMPOSITION_TOOL, CHECK_OFF_SUBTASK_TOOL, STRENGTHEN_STEP_CHECK_TOOL,
+]
 
 # Tools available inside an active step (executing it) -- full access,
 # because mark_step_done re-verifies with the real acceptance command.
@@ -376,6 +452,34 @@ class Agent:
             self.session.save_state(state)
             print(f"[run] goal: {goal!r}")
 
+        # FLAW 7: wire the durable-pending-question hooks to THIS run's
+        # state now that it exists (ToolBox itself is constructed once in
+        # __init__, before any RunState does).
+        self.toolbox._on_question_asked = lambda q: self._persist_pending_question(state, q)
+        self.toolbox._on_question_answered = lambda: self._clear_pending_question(state)
+
+        # A question left in state.pending_question means a previous run
+        # was killed (crash, kill -9 -- NOT the Ctrl-C path below, which
+        # already saves cleanly) while blocked waiting on the human, after
+        # the question was persisted but before any answer came back. The
+        # in-memory chat history that asked it is gone either way, so
+        # silently discarding the question would silently discard whatever
+        # made it worth asking. Re-ask it now, fold the answer into the
+        # scratchpad so the model sees it on its very next turn, and clear
+        # the flag -- conservatively re-asking is the safe direction here,
+        # not assuming an answer that may never have actually arrived.
+        if state.pending_question:
+            print("\n[resume] a question was left pending from an earlier, interrupted run:")
+            answer = ask_human_question(state.pending_question)
+            self._set_scratchpad(
+                state,
+                state.scratchpad
+                + f"\n[Resumed question]: {state.pending_question}\n[Answer]: {answer}"
+            )
+            state.pending_question = None
+            self.session.log_event("pending_question_resolved_on_resume", {"answer": answer})
+            self.session.save_state(state)
+
         try:
             self._outer_loop(state, final_acceptance_command)
         except KeyboardInterrupt:
@@ -385,6 +489,151 @@ class Agent:
 
         self._print_summary(state)
         return state
+
+    def _persist_pending_question(self, state: RunState, question: str) -> None:
+        state.pending_question = question
+        self.session.log_event("question_pending", {"question": question})
+        self.session.save_state(state)
+
+    def _clear_pending_question(self, state: RunState) -> None:
+        state.pending_question = None
+        self.session.save_state(state)
+
+    def reopen(self, additional_instructions: str) -> RunState:
+        """
+        FLAW 1: declare_done (and the run-ending escalation path) used to
+        be a true dead end -- state.status flips to "done"/"aborted" and
+        _outer_loop's `while state.status == "running"` guard means a
+        plain `resume` on that session is a silent no-op forever after.
+        There was nothing durable to re-scope back onto, either -- goal
+        was a bare string.
+
+        This is the human-facing correction path: "actually, X still needs
+        fixing" without starting a fresh workspace/session and losing the
+        completed-steps history, lessons, and decisions already recorded.
+        It is NOT a model-callable tool -- by the time a run has reached
+        "done"/"aborted" the process has already exited; there is no live
+        loop for the model to call anything from. Call this, THEN
+        agent.run(resume=True) to actually continue.
+        """
+        state = self.session.load_state()
+        if state is None:
+            raise ValueError("no existing session to reopen -- use 'start' for a new one")
+        if state.status == "running":
+            raise ValueError(
+                "session is still running -- reopen is only for a session "
+                "that already ended (done/aborted); resume it normally instead"
+            )
+        state.goal = f"{state.goal}\n\n[REOPENED] {additional_instructions}"
+        state.decomposition.add(additional_instructions)
+        state.status = "running"
+        self.session.log_event("goal_reopened", {"additional_instructions": additional_instructions})
+        self.session.save_state(state)
+        return state
+
+    def export_session(self, output_path: Path) -> dict:
+        """
+        FLAW 10 (part 1): all state was previously workspace-local with no
+        way out -- no export, no continuing a run on a different machine.
+        Bundles the session state plus this workspace's lessons/decisions
+        (the durable knowledge, not just the in-progress run) into one
+        portable JSON file, tagged with the git commit it was verified
+        against so an eventual import can warn if the code has moved on.
+        """
+        state = self.session.load_state()
+        if state is None:
+            raise ValueError("no session in this workspace to export")
+        bundle = {
+            "schema_version": 1,
+            "exported_at": time.time(),
+            "git_head": self.workspace.git_head(),
+            "session": state.to_dict(),
+            "lessons": self._read_json_if_exists(self.config.lessons_file),
+            "decisions": self._read_json_if_exists(self.config.decisions_file),
+        }
+        output_path.write_text(json.dumps(bundle, indent=2), encoding="utf-8")
+        return bundle
+
+    def import_session(self, bundle_path: Path, force: bool = False) -> RunState:
+        """
+        FLAW 10 (part 2): the other half of export_session -- restores a
+        bundle into THIS workspace so a run can continue on a different
+        machine/clone. Refuses to clobber an existing session unless
+        force=True (this is a destructive overwrite of local session
+        state, not a merge). Warns rather than blocks on a git_head
+        mismatch: the code may have moved on since export, which means
+        completed_steps' acceptance commands aren't guaranteed to still
+        apply -- but the human asked for this import, so inform, don't
+        override that decision.
+        """
+        bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+        if bundle.get("schema_version") != 1:
+            raise ValueError(f"unrecognized export schema_version: {bundle.get('schema_version')!r}")
+        if self.session.load_state() is not None and not force:
+            raise ValueError(
+                "a session already exists in this workspace -- pass force=True to overwrite it"
+            )
+
+        current_head = self.workspace.git_head()
+        bundle_head = bundle.get("git_head")
+        if bundle_head and current_head and bundle_head != current_head:
+            print(
+                f"[import] WARNING: bundle was exported at commit {bundle_head[:12]}, "
+                f"this workspace is at {current_head[:12]}. Completed steps' acceptance "
+                "commands may no longer apply -- consider a regression check once resumed."
+            )
+
+        state = RunState.from_dict(bundle["session"])
+        self.session.save_state(state)
+        if bundle.get("lessons") is not None:
+            self.config.lessons_file.write_text(json.dumps(bundle["lessons"], indent=2), encoding="utf-8")
+        if bundle.get("decisions") is not None:
+            self.config.decisions_file.write_text(json.dumps(bundle["decisions"], indent=2), encoding="utf-8")
+        self.session.log_event("session_imported", {"bundle_git_head": bundle_head, "current_git_head": current_head})
+        return state
+
+    def import_lessons(self, other_lessons_path: Path) -> int:
+        """
+        FLAW 10 (part 3) / cross-workspace knowledge sharing: lessons are
+        genuinely useful beyond the run (or even the project) that
+        produced them -- a lesson about this model's quirks, or a recurring
+        environment gotcha, is worth carrying into a brand new workspace.
+        This is a MERGE, not an overwrite: only active lessons not already
+        present (by symptom+fix, ignoring which project they came from)
+        are added, each through the normal add() path so eviction/cap
+        rules still apply. Returns how many were actually added.
+        """
+        other_raw = self._read_json_if_exists(other_lessons_path)
+        if not other_raw:
+            return 0
+        existing = {(l.symptom, l.fix) for l in self.lessons.load()}
+        added = 0
+        for entry in other_raw.get("lessons", []):
+            if not entry.get("active", True):
+                continue
+            key = (entry.get("symptom", ""), entry.get("fix", ""))
+            if key in existing:
+                continue
+            self.lessons.add(
+                context=entry.get("context", "(imported from another workspace)"),
+                symptom=entry.get("symptom", ""),
+                fix=entry.get("fix", ""),
+                intent=entry.get("intent", ""),
+            )
+            existing.add(key)
+            added += 1
+        if added:
+            self.session.log_event("lessons_imported", {"count": added, "source": str(other_lessons_path)})
+        return added
+
+    @staticmethod
+    def _read_json_if_exists(path: Path) -> dict | None:
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return None
 
     # ── LLM call wrapper: backend failures don't crash the run ─────────────
 
@@ -723,6 +972,18 @@ class Agent:
         # matches the actual evidence (two consecutive steps, same file)
         # without guessing how far back to look.
         last_completed_step_files: set[str] = set()
+        # FLAW 8/14: counts completed steps since the last self-audit pass.
+        # Reset to 0 whenever an audit actually runs; a value of 0 for
+        # self_audit_every_n_steps disables the mechanism entirely.
+        steps_since_audit = 0
+        # Length of the current run of consecutive completed steps whose
+        # titles all look like the same fix repeated (see
+        # _steps_look_like_repeats). A fresh step that ISN'T similar to the
+        # one before it restarts the streak at 1 (itself), not 0 -- it's
+        # still one step. Escalates once the streak hits
+        # _CONSECUTIVE_SIMILAR_STEP_THRESHOLD rather than letting the model
+        # keep proposing another near-identical "fix".
+        consecutive_similar_steps = 0
 
         while state.status == "running":
             # Reset for record_decision's originating_step -- _inner_loop
@@ -752,6 +1013,7 @@ class Agent:
             # instead of only appearing after the model has already
             # committed to propose_step.
             context_msg = (
+                f"GOAL BREAKDOWN:\n{_decomposition_with_reconciliation_hints(state)}\n\n"
                 f"COMPLETED STEPS SO FAR:\n{state.completed_summary_text()}\n\n"
                 f"SCRATCHPAD:\n{state.scratchpad or '(empty)'}\n\n"
                 f"HARNESS-CONDENSED UNDERSTANDING, per file (built automatically as you read "
@@ -970,6 +1232,32 @@ class Agent:
                     self._finalize_pending_lesson(fix_summary=f"step '{title}' completed: {completed.summary}")
                     self.session.save_state(state)
                     self.session.log_event("step_completed", {"index": completed.index, "title": completed.title})
+
+                    if len(state.completed_steps) == 1:
+                        consecutive_similar_steps = 1
+                    elif _steps_look_like_repeats(state.completed_steps[-2], state.completed_steps[-1]):
+                        consecutive_similar_steps += 1
+                    else:
+                        consecutive_similar_steps = 1
+                    if consecutive_similar_steps >= _CONSECUTIVE_SIMILAR_STEP_THRESHOLD:
+                        recent_titles = [s.title for s in state.completed_steps[-_CONSECUTIVE_SIMILAR_STEP_THRESHOLD:]]
+                        self.session.log_event("consecutive_similar_steps_escalated", {"titles": recent_titles})
+                        self._escalate(
+                            state,
+                            f"The last {_CONSECUTIVE_SIMILAR_STEP_THRESHOLD} completed steps all look like the "
+                            f"same fix repeated under different titles: {recent_titles}. Each one passed its "
+                            "own check when it ran, but something is likely making the same problem recur "
+                            "(e.g. a test or verification step mutating a file that an earlier step's check "
+                            "pins to an exact state) rather than each being a genuinely new problem. Continuing "
+                            "to propose another near-identical fix is unlikely to break the cycle."
+                        )
+                        consecutive_similar_steps = 1
+
+                    steps_since_audit += 1
+                    if self.config.budget.self_audit_every_n_steps > 0 \
+                            and steps_since_audit >= self.config.budget.self_audit_every_n_steps:
+                        self._run_self_audit(state)
+                        steps_since_audit = 0
                     # reset outer history after each completed step so context
                     # stays bounded and old tool output doesn't pile up
                     history = []
@@ -984,6 +1272,112 @@ class Agent:
                     self._set_scratchpad(state, call.input.get("scratchpad", ""))
                     self.session.save_state(state)
                     tool_results.append(ToolResult(tool_call_id=call.id, content="Scratchpad updated."))
+                    acted = True
+                    continue
+
+                if call.name == "set_goal_decomposition":
+                    titles = call.input.get("subtasks", []) or []
+                    if isinstance(titles, str):
+                        titles = [titles]
+                    titles = [str(t) for t in titles if str(t).strip()]
+                    if not titles:
+                        tool_results.append(ToolResult(
+                            tool_call_id=call.id, is_error=True,
+                            content="subtasks must be a non-empty list of titles.",
+                        ))
+                        acted = True
+                        continue
+                    preserved, added_titles, dropped = state.decomposition.replace(titles)
+                    self.session.save_state(state)
+                    dropped_done = [s.title for s in dropped if s.status == "done"]
+                    self.session.log_event("goal_decomposition_set", {
+                        "count": len(state.decomposition.subtasks),
+                        "preserved": len(preserved),
+                        "added": len(added_titles),
+                        "dropped": [s.title for s in dropped],
+                        "dropped_done": dropped_done,
+                    })
+                    result_lines = ["Breakdown set:", state.decomposition.summary_text()]
+                    if preserved:
+                        result_lines.append(
+                            f"({len(preserved)} item(s) matched an existing title exactly and kept "
+                            "their done/pending status; reword a title if you want it treated as new.)"
+                        )
+                    if dropped_done:
+                        result_lines.append(
+                            "WARNING: the following were marked done before and are NOT in this new "
+                            f"list, so they're no longer tracked at all: {dropped_done}"
+                        )
+                    tool_results.append(ToolResult(
+                        tool_call_id=call.id,
+                        content="\n".join(result_lines),
+                    ))
+                    acted = True
+                    continue
+
+                if call.name == "check_off_subtask":
+                    subtask_id = str(call.input.get("id", "")).strip()
+                    subtask = state.decomposition.get(subtask_id)
+                    if subtask is None:
+                        tool_results.append(ToolResult(
+                            tool_call_id=call.id, is_error=True,
+                            content=(
+                                f"No subtask with id '{subtask_id}'. Current breakdown:\n"
+                                f"{state.decomposition.summary_text()}"
+                            ),
+                        ))
+                        acted = True
+                        continue
+                    subtask.status = "done"
+                    self.session.save_state(state)
+                    self.session.log_event("subtask_checked_off", {"id": subtask_id, "title": subtask.title})
+                    tool_results.append(ToolResult(
+                        tool_call_id=call.id,
+                        content=f"Marked done: {subtask.title}",
+                    ))
+                    acted = True
+                    continue
+
+                if call.name == "strengthen_step_check":
+                    try:
+                        step_index = int(call.input.get("step_index"))
+                    except (TypeError, ValueError):
+                        tool_results.append(ToolResult(
+                            tool_call_id=call.id, is_error=True,
+                            content="step_index must be an integer matching a completed step's [index].",
+                        ))
+                        acted = True
+                        continue
+                    target_step = next((s for s in state.completed_steps if s.index == step_index), None)
+                    if target_step is None:
+                        tool_results.append(ToolResult(
+                            tool_call_id=call.id, is_error=True,
+                            content=f"No completed step with index {step_index}.",
+                        ))
+                        acted = True
+                        continue
+                    additional_command = str(call.input.get("additional_command", "")).strip()
+                    validation_problem = _validate_acceptance_command(additional_command)
+                    if validation_problem:
+                        tool_results.append(ToolResult(
+                            tool_call_id=call.id, is_error=True,
+                            content=f"additional_command is invalid: {validation_problem}",
+                        ))
+                        acted = True
+                        continue
+                    target_step.additional_checks.append(additional_command)
+                    self.session.save_state(state)
+                    self.session.log_event("step_check_strengthened", {
+                        "step_index": step_index, "additional_command": additional_command,
+                        "reason": call.input.get("reason", ""),
+                    })
+                    tool_results.append(ToolResult(
+                        tool_call_id=call.id,
+                        content=(
+                            f"Added. Step {step_index} now also re-runs: {additional_command}\n"
+                            "This will be checked on every future regression check, including declare_done."
+                        ),
+                    ))
                     acted = True
                     continue
 
@@ -1295,6 +1689,113 @@ class Agent:
         })
         return True
 
+    def _run_self_audit(self, state: RunState) -> None:
+        """
+        FLAW 8 + FLAW 14, wired together as one mechanism rather than two:
+        every `self_audit_every_n_steps` completed steps, a dedicated
+        planner_llm pass (not offered to the model as a tool -- this is a
+        harness-scheduled checkpoint, not a model choice) reviews the goal,
+        the decomposition, and the completed-step log, then:
+          - flags if the run looks like it's drifted off the actual goal
+            (FLAW 8: nothing previously paused the loop to ask this on its
+            own schedule -- only the repetition detectors, which react to
+            explicit stalling/cycling, not silent drift while steps keep
+            passing);
+          - distills the step log into a fresh scratchpad note (FLAW 14:
+            replaces the previous scratchpad rather than letting it grow
+            or go stale, a deliberate "take stock" pass on a schedule
+            rather than only reactively at file-batch/condensation points).
+        Best-effort: an LLMError here is logged and skipped, exactly like
+        the existing condensation passes -- a failed audit must never be
+        the thing that halts or derails an otherwise-healthy run.
+        """
+        prompt = (
+            f"GOAL:\n{state.goal}\n\n"
+            f"GOAL BREAKDOWN:\n{_decomposition_with_reconciliation_hints(state)}\n\n"
+            f"COMPLETED STEPS SO FAR:\n{state.completed_summary_text()}\n\n"
+            f"CURRENT SCRATCHPAD:\n{state.scratchpad or '(empty)'}\n\n"
+            "Take stock. Based ONLY on the evidence above:\n"
+            "1. Is this run still working toward the stated GOAL, or has it "
+            "drifted onto something else?\n"
+            "2. Is there a genuinely new, distinct piece of the goal that "
+            "isn't yet tracked in the breakdown and should be added?\n"
+            "3. Do any [ ] (not yet checked off) breakdown items above look "
+            "genuinely satisfied by the completed steps -- not just a '>>' "
+            "hint, actually satisfied on reading the evidence? List their ids.\n"
+            "4. Distill the completed-steps log into a short note capturing "
+            "what actually matters going forward -- this REPLACES the "
+            "current scratchpad, so keep anything from it that's still "
+            "relevant.\n\n"
+            "Respond with EXACTLY four lines, nothing else:\n"
+            "ON_TRACK: yes or no\n"
+            "NEW_SUBTASK: <short title, or NONE>\n"
+            "SATISFIED_SUBTASKS: <comma-separated ids, or NONE>\n"
+            "NOTE: <the distilled note>"
+        )
+        try:
+            response = self.planner_llm.complete(
+                system=(
+                    "You are the periodic self-audit pass for an autonomous coding "
+                    "run. You do not write code and you do not decide the next step "
+                    "-- you only check the run is still on track, reconcile the "
+                    "tracked breakdown against what's actually been completed, and "
+                    "distill progress so far."
+                ),
+                history=[Turn(role="user", text=prompt)],
+                tools=[],
+                max_tokens=self.config.budget.max_output_tokens,
+            )
+        except LLMError as e:
+            self.session.log_event("self_audit_llm_error", {"error": str(e)})
+            return
+
+        on_track, new_subtask, note, satisfied_ids = _parse_self_audit_response(response.text or "")
+        if new_subtask:
+            state.decomposition.add(new_subtask)
+
+        # Real bug, seen in an actual run: the model set a decomposition,
+        # did all the matching work across 8 steps, and never once called
+        # check_off_subtask -- every entry sat at "pending" the entire run.
+        # The context-level hint (_decomposition_with_reconciliation_hints)
+        # is the first line of defense; this is the second -- a dedicated
+        # review pass explicitly asked to reconcile, with the authority to
+        # actually check things off rather than only hoping the outer-loop
+        # model notices a hint. Unlike the outer loop's check_off_subtask
+        # tool, self-audit isn't a model choice about what to do next, it's
+        # a harness-scheduled correctness pass -- same trust level as the
+        # scratchpad rewrite it already does unprompted.
+        newly_satisfied = []
+        for subtask_id in satisfied_ids:
+            subtask = state.decomposition.get(subtask_id)
+            if subtask is not None and subtask.status != "done":
+                subtask.status = "done"
+                newly_satisfied.append(subtask_id)
+        if newly_satisfied:
+            self.session.log_event("self_audit_reconciled_subtasks", {"ids": newly_satisfied})
+
+        # FLAW 2: piggyback the regression check on this same checkpoint,
+        # rather than only discovering a regression once, all at once, at
+        # declare_done. Catching it here means it surfaces on the model's
+        # very next turn instead of after however many more steps happen
+        # to follow before the goal is declared done.
+        regression_feedback = self._check_no_regressions(state)
+        if regression_feedback:
+            on_track = False
+            note = (regression_feedback + "\n\n" + note).strip() if note else regression_feedback
+            self.session.log_event("self_audit_found_regression", {})
+
+        if note:
+            drift_prefix = (
+                "[SELF-AUDIT: this run may have drifted from the goal -- re-read "
+                "GOAL below before continuing]\n" if not on_track else ""
+            )
+            self._set_scratchpad(state, drift_prefix + note)
+        self.session.log_event("self_audit", {
+            "on_track": on_track, "new_subtask": new_subtask, "has_note": bool(note),
+            "satisfied_subtasks": newly_satisfied,
+        })
+        self.session.save_state(state)
+
     def _inner_loop(
         self,
         state: RunState,
@@ -1399,7 +1900,28 @@ class Agent:
                     )
                     break  # try another attempt, with fresh history
 
-                response = self._call_llm(state, system, history, INNER_TOOLS)
+                try:
+                    response = self._call_llm(state, system, history, INNER_TOOLS)
+                except BudgetExceeded as e:
+                    # Same funnel as the budget.step() path above: this can
+                    # fire mid-attempt (record_usage's max_total_tokens
+                    # ceiling, raised deep inside _call_llm) just as easily
+                    # as the step-count budget can. Without this catch it
+                    # propagated uncaught past the attempt loop entirely --
+                    # no revert, no replan chance -- abandoning whatever the
+                    # attempt had in progress. Routing it through the same
+                    # attempts/derailed_attempts counters means it now gets
+                    # the same replan-then-escalate treatment.
+                    self.session.log_event("total_token_budget_exceeded", {"title": step_context.title, "detail": str(e)})
+                    derailed_attempts += 1
+                    attempts += 1
+                    last_attempt_note = (
+                        "A previous attempt on this step ran out of the total token budget "
+                        "without ever calling mark_step_done. Its edits have been reverted -- "
+                        "the workspace is back to the last passing commit, so start clean. "
+                        "Work directly and efficiently toward mark_step_done this time."
+                    )
+                    break  # try another attempt, with fresh history
                 history.append(Turn(role="assistant", text=response.text, tool_calls=response.tool_calls))
 
                 if not response.tool_calls:
@@ -1577,6 +2099,7 @@ class Agent:
                                 context=f"step: {step_context.title}",
                                 symptom=last_failure_detail,
                                 fix=f"eventually succeeded with: {summary}",
+                                intent=step_context.objective or state.goal,
                             )
                         return CompletedStep(
                             index=state.next_index(),
@@ -1646,30 +2169,37 @@ class Agent:
     # ── done verification ──────────────────────────────────────────────────
 
     def _check_no_regressions(self, state: RunState) -> str | None:
-        """Re-run every previously-completed step's acceptance command.
-        Without this, step 7 can silently break what step 3 verified --
-        each step's check only runs once, at the moment it's marked done,
-        and git_commit_all's `git add -A` sweeps up whatever the working
-        tree looks like at that point regardless. Returns None if every
-        prior step still passes, or feedback text (naming which step
-        regressed) to send back to the model if not."""
+        """Re-run every previously-completed step's acceptance command --
+        AND (FLAW 2) every additional_checks entry added later via
+        strengthen_step_check, since a step's original command was only
+        ever proven against the input/case that existed when it was
+        written. Without this, step 7 can silently break what step 3
+        verified -- each step's check only runs once, at the moment it's
+        marked done, and git_commit_all's `git add -A` sweeps up whatever
+        the working tree looks like at that point regardless. Returns None
+        if every check on every prior step still passes, or feedback text
+        (naming which step and which specific command regressed) to send
+        back to the model if not."""
         for step in state.completed_steps:
-            result = self.toolbox.run_gated_command(
-                step.acceptance_command,
-                timeout=self.config.budget.default_command_timeout,
-            )
-            if result.exit_code != 0 or result.timed_out:
-                print(f"[regression-check] step {step.index} ('{step.title}') now FAILS")
-                return (
-                    f"Regression detected: step {step.index} ('{step.title}') used to pass "
-                    f"its acceptance command but does not anymore.\n"
-                    f"$ {step.acceptance_command}\n"
-                    f"exit {result.exit_code}{' (TIMED OUT)' if result.timed_out else ''}\n"
-                    f"stdout:\n{result.stdout[-2000:]}\nstderr:\n{result.stderr[-2000:]}\n"
-                    "Fix this regression before declaring the goal done."
+            checks = [step.acceptance_command] + step.additional_checks
+            for cmd in checks:
+                result = self.toolbox.run_gated_command(
+                    cmd, timeout=self.config.budget.default_command_timeout,
                 )
+                if result.exit_code != 0 or result.timed_out:
+                    print(f"[regression-check] step {step.index} ('{step.title}') now FAILS: {cmd}")
+                    return (
+                        f"Regression detected: step {step.index} ('{step.title}') used to pass "
+                        f"this check but does not anymore.\n"
+                        f"$ {cmd}\n"
+                        f"exit {result.exit_code}{' (TIMED OUT)' if result.timed_out else ''}\n"
+                        f"stdout:\n{result.stdout[-2000:]}\nstderr:\n{result.stderr[-2000:]}\n"
+                        "Fix this regression before declaring the goal done."
+                    )
         if state.completed_steps:
-            print(f"[regression-check] {len(state.completed_steps)}/{len(state.completed_steps)} prior steps still pass")
+            total_checks = sum(1 + len(s.additional_checks) for s in state.completed_steps)
+            print(f"[regression-check] {total_checks}/{total_checks} checks across "
+                  f"{len(state.completed_steps)} prior step(s) still pass")
         return None
 
     def _verify_done(self, state: RunState, summary: str,
@@ -1678,6 +2208,29 @@ class Agent:
         otherwise it's real command output (acceptance-command path) or
         whatever the human typed (interactive path) -- either way it goes
         back to the model, not just a generic 'try again'."""
+        # Real bug, seen in an actual run: the model declared the goal
+        # done citing "three" completed items while the tracked breakdown
+        # actually had four, two of which were still "pending" despite
+        # matching completed work almost exactly. The reconciliation hint
+        # (_decomposition_with_reconciliation_hints) only ever SUGGESTS --
+        # it can't help if the model doesn't act on it before declaring
+        # done. This sweep is the backstop: applied unconditionally, right
+        # here, regardless of accept/reject outcome, so the persisted
+        # decomposition record reflects reality by the time anyone (the
+        # human reviewing this, or a future reopen()) looks at it. Unlike
+        # the set_goal_decomposition preservation fix, getting this match
+        # wrong is low-stakes -- worst case a bookkeeping entry reads
+        # "done" a little generously; it can never flip something the
+        # other direction or affect what's actually been verified.
+        reconciled_ids = []
+        for s in state.decomposition.subtasks:
+            if s.status != "done" and _find_satisfying_completed_step(s, state.completed_steps):
+                s.status = "done"
+                reconciled_ids.append(s.id)
+        if reconciled_ids:
+            self.session.log_event("declare_done_reconciled_subtasks", {"ids": reconciled_ids})
+            self.session.save_state(state)
+
         regression_feedback = self._check_no_regressions(state)
         if regression_feedback:
             return False, regression_feedback
@@ -1744,6 +2297,7 @@ class Agent:
             context=pending["context"],
             symptom=f"{pending['symptom']}\nHuman guidance given: {pending['guidance']}",
             fix=f"run continued and succeeded afterward: {fix_summary}",
+            intent=pending.get("intent", ""),
         )
         self._pending_escalation_lesson = None
 
@@ -1770,6 +2324,7 @@ class Agent:
             "context": f"escalation: {reason}",
             "symptom": reason,
             "guidance": guidance,
+            "intent": state.goal,
         }
         # Fresh budget span -- without this, the next outer_step() call would
         # immediately re-raise on an already-over-cap counter and guidance
@@ -1861,6 +2416,20 @@ Rules:
   the step until a single specific command can meaningfully verify it.
 - Use the scratchpad (update_scratchpad or the scratchpad field of
   mark_step_done) to keep working notes across steps.
+- If the goal has multiple genuinely separate parts, call
+  set_goal_decomposition once, early, to track them; check items off with
+  check_off_subtask as they're finished. Skip this for a goal that's
+  already one focused piece of work -- it exists for tracking, not busywork.
+  Do this checking-off AS PART OF finishing a step that satisfies one of
+  the tracked parts, not as a separate thing to remember later -- the
+  breakdown is only useful if it stays current. A '>>' hint next to a
+  breakdown item means a completed step looks like it satisfies it; verify
+  and check it off if so.
+- If you discover an already-completed step's acceptance check only
+  proved a narrower property than what later work now depends on, use
+  strengthen_step_check to add a further command to it. Every completed
+  step's checks (original plus any added) are re-run before the goal can
+  be declared done, and periodically during the run.
 - Only call declare_done when ALL work is complete and verifiable.
 - Do NOT propose_step just to "declare completion" or "finalize" -- call
   declare_done directly instead. It's independently verified already; a
@@ -1870,6 +2439,15 @@ Rules:
 """
 
     def _inner_system_prompt(self, state: RunState, step_context: StepContext) -> str:
+        # FLAW 13: match lessons against THIS step's actual failure surface
+        # (title+objective) rather than just showing the most recent N --
+        # a lesson from an unrelated part of the project shown here purely
+        # because it's recent is a distraction, not a lesson learned.
+        # Falls back to the recent-N view when nothing scores a match, so
+        # early in a project (few lessons, little keyword overlap yet)
+        # lessons are never silently hidden.
+        matches = self.lessons.find_relevant(f"{step_context.title} {step_context.objective}")
+        lessons_text = LessonsStore.render(matches) if matches else self.lessons.summary_text()
         return f"""You are an autonomous coding agent working in a real git repository.
 
 OS: {shell_description()}
@@ -1881,7 +2459,7 @@ COMPLETED SO FAR:
 
 LESSONS FROM PAST RUNS IN THIS WORKSPACE (verified -- each was an actual problem
 followed by a confirmed successful outcome, not a guess):
-{self.lessons.summary_text()}
+{lessons_text}
 
 ACTIVE DECISIONS FOR THIS PROJECT (durable choices already made -- do not
 contradict these; if you make a NEW architecture/technology/convention choice
@@ -2083,6 +2661,131 @@ def _parse_replan_response(text: str) -> tuple[str, str]:
         elif current is not None:
             current.append(line)
     return "\n".join(objective_lines).strip(), "\n".join(command_lines).strip()
+
+
+def _parse_self_audit_response(text: str) -> tuple[bool, str, str, list[str]]:
+    """Parses the self-audit pass's four-line format:
+        ON_TRACK: yes|no
+        NEW_SUBTASK: <title, or NONE>
+        SATISFIED_SUBTASKS: <comma-separated ids, or NONE>
+        NOTE: <distilled note to carry forward>
+    Same tolerance rules as _parse_replan_response. Defaults to on_track=True
+    on a malformed/unparseable response -- a best-effort audit pass that
+    came back garbled should never itself be the thing that halts or
+    derails a run; it just means this cycle's audit didn't add anything."""
+    on_track = True
+    new_subtask = ""
+    satisfied_ids: list[str] = []
+    note_lines: list[str] = []
+    current: list[str] | None = None
+    for line in text.splitlines():
+        upper = line.upper()
+        if upper.startswith("ON_TRACK:"):
+            on_track = "no" not in line.split(":", 1)[1].strip().lower()
+            current = None
+        elif upper.startswith("NEW_SUBTASK:"):
+            new_subtask = line.split(":", 1)[1].strip()
+            current = None
+        elif upper.startswith("SATISFIED_SUBTASKS:"):
+            raw = line.split(":", 1)[1].strip()
+            if raw.upper() != "NONE" and raw:
+                satisfied_ids = [s.strip() for s in raw.split(",") if s.strip()]
+            current = None
+        elif upper.startswith("NOTE:"):
+            current = note_lines
+            current.append(line.split(":", 1)[1].strip())
+        elif current is not None:
+            current.append(line)
+    note = "\n".join(note_lines).strip()
+    if new_subtask.upper() == "NONE":
+        new_subtask = ""
+    return on_track, new_subtask, note, satisfied_ids
+
+
+def _find_satisfying_completed_step(subtask: "Subtask", completed_steps: list[CompletedStep]) -> CompletedStep | None:
+    """Shared by the reconciliation hint (surfaces a suggestion, never
+    writes) and the declare_done reconciliation sweep (actually applies
+    it, see _verify_done). Same deterministic keyword-overlap approach
+    used throughout this file (lessons matching, the thrash detector) --
+    not fuzzy/ML matching. Returns the strongest-overlap completed step,
+    or None if nothing scores at least 2 shared significant keywords."""
+    subtask_words = _keywords(subtask.title)
+    best: tuple[int, CompletedStep] | None = None
+    for step in completed_steps:
+        overlap = len(subtask_words & _keywords(f"{step.title} {step.summary}"))
+        if overlap >= 2 and (best is None or overlap > best[0]):
+            best = (overlap, step)
+    return best[1] if best else None
+
+
+def _decomposition_with_reconciliation_hints(state: RunState) -> str:
+    """
+    Real bug, seen in an actual run: the model called set_goal_decomposition
+    once, then did all four matching pieces of work across 8 completed
+    steps, and never once called check_off_subtask -- every subtask sat at
+    "pending" for the entire run despite being done, because nothing ever
+    prompted reconciliation between the two. Self-audit alone wasn't
+    enough: it only fires every N steps and only ever ADDS subtasks, never
+    reconciles existing ones.
+
+    This is a deterministic (same keyword-overlap approach as
+    lessons.find_relevant), always-on hint shown on EVERY outer turn, not
+    just at self-audit cadence -- it never auto-checks anything off itself
+    (that stays the model's call, same as every other tool use in this
+    harness), it just makes the mismatch impossible to miss for more than
+    one turn.
+    """
+    if not state.decomposition.subtasks:
+        return state.decomposition.summary_text()
+    lines = []
+    for s in state.decomposition.subtasks:
+        note = f" -- {s.notes}" if s.notes else ""
+        if s.status == "done":
+            lines.append(f"  [x] ({s.id}) {s.title}{note}")
+            continue
+        match = _find_satisfying_completed_step(s, state.completed_steps)
+        if match:
+            lines.append(
+                f"  [ ] ({s.id}) {s.title}{note}\n"
+                f"      >> looks satisfied by completed step {match.index} "
+                f"('{match.title}') -- call check_off_subtask if it actually is"
+            )
+        else:
+            lines.append(f"  [ ] ({s.id}) {s.title}{note}")
+    return "\n".join(lines)
+
+
+_CONSECUTIVE_SIMILAR_STEP_THRESHOLD = 3
+
+
+def _steps_look_like_repeats(a: CompletedStep, b: CompletedStep) -> bool:
+    """
+    Real bug, seen in an actual run: 27 of 35 completed steps were all
+    "fix data/expenses.csv duplicate row" under cosmetically different
+    titles ('Fix...', 'Rewrite...', 'Trim...', 'Remove duplicate...'),
+    because a regression kept recurring (something else in the run was
+    mutating a tracked data file as a side effect) and the model treated
+    each recurrence as a fresh, unrelated problem instead of recognizing
+    the pattern. Nothing caught this: each individual step DID pass its
+    own acceptance check when it ran, so the inner-loop stall/repetition
+    detectors (which react to a step's own tool-call pattern) never fired,
+    and self-audit's regression detection only ever left a note -- it
+    never stopped the model from proposing yet another near-identical fix.
+
+    Deliberately narrow and deterministic (same keyword-overlap approach
+    as lessons.find_relevant, not fuzzy/ML matching): two completed steps
+    "look like repeats" only if their titles share enough significant
+    keywords that they're very likely re-attempting the same underlying
+    fix, not just coincidentally similar wording for genuinely different
+    work.
+    """
+    a_words = _keywords(a.title)
+    b_words = _keywords(b.title)
+    if not a_words or not b_words:
+        return False
+    overlap = len(a_words & b_words)
+    smaller = min(len(a_words), len(b_words))
+    return overlap >= 2 and overlap / smaller >= 0.5
 
 
 def _inner_loop_failure_reason(title: str, check_failures: int, derailed_attempts: int) -> str:

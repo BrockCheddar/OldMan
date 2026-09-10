@@ -14,8 +14,114 @@ the model can freely update with working notes.
 from __future__ import annotations
 
 import json
+import uuid
 from dataclasses import dataclass, field, asdict
 from typing import Literal
+
+MAX_SUBTASKS = 40
+
+
+@dataclass
+class Subtask:
+    id: str
+    title: str
+    status: Literal["pending", "done"] = "pending"
+    notes: str = ""
+
+
+@dataclass
+class GoalDecomposition:
+    """Durable structure for 'what's left', so the outer loop isn't
+    re-interpreting a bare goal string on every read. Deliberately just a
+    flat list with a status flag -- no dependency graph, no ordering
+    constraints. The outer loop already provides sequencing (one
+    propose_step at a time); this only tracks which pieces of a
+    multi-part goal are still open, so a step doesn't need to squint at
+    the original goal text to figure out what remains.
+    """
+    subtasks: list[Subtask] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {"subtasks": [asdict(s) for s in self.subtasks]}
+
+    @classmethod
+    def from_dict(cls, d: dict | None) -> "GoalDecomposition":
+        if not d:
+            return cls()
+        return cls(subtasks=[Subtask(**s) for s in d.get("subtasks", [])])
+
+    def get(self, subtask_id: str) -> Subtask | None:
+        for s in self.subtasks:
+            if s.id == subtask_id:
+                return s
+        return None
+
+    def add(self, title: str) -> Subtask:
+        """Append one new entry without disturbing existing ones -- distinct
+        from replace(), which re-plans the whole breakdown. Used by
+        Agent.reopen(): re-scoping a finished run must not silently wipe
+        out the record of what was already tracked as done."""
+        subtask = Subtask(id=uuid.uuid4().hex[:8], title=title[:200])
+        if len(self.subtasks) < MAX_SUBTASKS:
+            self.subtasks.append(subtask)
+        return subtask
+
+    def replace(self, titles: list[str]) -> tuple[list[Subtask], list[str], list[Subtask]]:
+        """
+        Full replace, used by set_goal_decomposition -- but NOT a blind
+        wipe. Real bug, seen in an actual run: re-declaring the breakdown
+        mid-run (e.g. to add a genuinely new item) used to reassign fresh
+        ids and reset EVERY entry to pending, including ones already
+        checked off -- silent, total data loss, with no warning and
+        nothing in the log beyond a bare count.
+
+        Now: any new title that exactly matches (case/whitespace
+        insensitive) an existing entry's title carries over that entry's
+        id, status, and notes. A title that's reworded, even slightly, is
+        NOT matched -- deliberately exact, not fuzzy. This operation
+        WRITES state (a status flip); unlike the reconciliation hint
+        (which only ever suggests, never writes) or the declare_done
+        sweep (where a wrong match is harmless bookkeeping), a wrong
+        match here could silently un-do or fabricate a "done" status.
+        Precision over recall.
+
+        Returns (preserved, added_titles, dropped):
+          preserved     -- Subtasks that kept their id/status/notes.
+          added_titles  -- titles with no old match (fresh pending entries).
+          dropped       -- old Subtasks that didn't reappear at all (including
+                            any that were "done" -- worth flagging to the caller,
+                            since this is the one case that's a genuine loss of
+                            tracked completion, not a reset).
+        """
+        old_by_title = {s.title.strip().lower(): s for s in self.subtasks}
+        seen_old_keys: set[str] = set()
+        preserved: list[Subtask] = []
+        added_titles: list[str] = []
+        new_subtasks: list[Subtask] = []
+        for t in titles[:MAX_SUBTASKS]:
+            key = t.strip().lower()
+            old = old_by_title.get(key)
+            if old is not None:
+                carried = Subtask(id=old.id, title=t, status=old.status, notes=old.notes)
+                new_subtasks.append(carried)
+                preserved.append(carried)
+                seen_old_keys.add(key)
+            else:
+                new_subtasks.append(Subtask(id=uuid.uuid4().hex[:8], title=t))
+                added_titles.append(t)
+        dropped = [s for s in self.subtasks if s.title.strip().lower() not in seen_old_keys]
+        self.subtasks = new_subtasks
+        return preserved, added_titles, dropped
+
+    def summary_text(self) -> str:
+        if not self.subtasks:
+            return "(not decomposed -- use set_goal_decomposition if the goal has multiple distinct parts worth tracking separately)"
+        lines = []
+        for s in self.subtasks:
+            mark = "x" if s.status == "done" else " "
+            note = f" -- {s.notes}" if s.notes else ""
+            lines.append(f"  [{mark}] ({s.id}) {s.title}{note}")
+        return "\n".join(lines)
 
 
 @dataclass
@@ -33,6 +139,17 @@ class CompletedStep:
     # reviewing session.json later can see a check moved, not just its
     # final state.
     original_acceptance_command: str | None = None
+    # FLAW 2: a step's original acceptance_command is proven exactly once,
+    # against exactly the input/case that existed when it was written --
+    # nothing re-verifies it against a DIFFERENT case later (e.g. a
+    # function that only got tested against positive numbers, then later
+    # work in the run starts relying on it handling negatives too). This
+    # lets strengthen_step_check append more commands after the fact,
+    # without disturbing the original (which stays the historical record
+    # of what actually passed when the step was committed). All of them
+    # -- original plus every entry here -- are re-run by the regression
+    # check, not just the original.
+    additional_checks: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -113,6 +230,18 @@ class RunState:
     # entry is untouched no matter what.
     condensed_files: dict[str, str] = field(default_factory=dict)
     status: Literal["running", "done", "aborted"] = "running"
+    decomposition: GoalDecomposition = field(default_factory=GoalDecomposition)
+    # FLAW 7: set the moment ask_human is called, cleared the moment an
+    # answer comes back -- see ToolBox's on_question_asked/on_question_answered
+    # hooks. Durable so a crash while blocked waiting on the human doesn't
+    # lose the fact a question was ever pending.
+    pending_question: str | None = None
+    # Only bounds the rendered PROMPT text (see completed_summary_text) --
+    # session.json's completed_steps list itself is never truncated, so the
+    # full on-disk audit trail is untouched. Without this, a run of a few
+    # hundred steps grows this section's token cost linearly forever, even
+    # though each individual step's rendered line is already small.
+    MAX_DETAILED_COMPLETED_STEPS = 30
 
     # ---- serialisation (for resumable sessions) ----
 
@@ -124,6 +253,8 @@ class RunState:
             "auto_read_log": self.auto_read_log,
             "condensed_files": self.condensed_files,
             "status": self.status,
+            "decomposition": self.decomposition.to_dict(),
+            "pending_question": self.pending_question,
         }
 
     @classmethod
@@ -135,6 +266,8 @@ class RunState:
             auto_read_log=d.get("auto_read_log", ""),
             condensed_files=d.get("condensed_files", {}),
             status=d.get("status", "running"),
+            decomposition=GoalDecomposition.from_dict(d.get("decomposition")),
+            pending_question=d.get("pending_question"),
         )
 
     # ---- summary helpers for system prompts ----
@@ -142,8 +275,14 @@ class RunState:
     def completed_summary_text(self) -> str:
         if not self.completed_steps:
             return "(nothing completed yet)"
+        cap = self.MAX_DETAILED_COMPLETED_STEPS
+        detailed = self.completed_steps[-cap:] if len(self.completed_steps) > cap else self.completed_steps
         lines = []
-        for s in self.completed_steps:
+        folded_count = len(self.completed_steps) - len(detailed)
+        if folded_count > 0:
+            first, last = self.completed_steps[0].index, detailed[0].index - 1
+            lines.append(f"  [{first}-{last}] {folded_count} earlier steps completed (see session.json for full log)")
+        for s in detailed:
             lines.append(f"  [{s.index}] {s.title}: {s.summary}")
         return "\n".join(lines)
 
