@@ -379,3 +379,85 @@ def test_record_decision_requires_nonblank_decision(tmp_path):
     tb, ws = make_toolbox(tmp_path)
     with pytest.raises(ToolError):
         tb.dispatch("record_decision", {"decision": ""})
+
+
+def test_ask_human_fires_question_hooks_around_the_blocking_call(tmp_path, monkeypatch):
+    """
+    FLAW 7: on_question_asked must fire BEFORE the blocking input() call
+    (so the question is persisted before the harness ever blocks), and
+    on_question_answered must fire after the answer comes back.
+    """
+    import autocoder.tools as tools_mod
+    events = []
+
+    def fake_ask(question):
+        # If on_question_asked hadn't fired yet, this assertion catches it.
+        assert events == [("asked", question)]
+        return "42"
+
+    monkeypatch.setattr(tools_mod, "ask_human_question", fake_ask)
+
+    ws = Workspace.create(tmp_path / "ws", source_repo=None)
+    cfg = Config(workspace_root=ws.root, approval=ApprovalPolicy(mode="smart"))
+    tb = ToolBox(
+        ws, cfg,
+        on_question_asked=lambda q: events.append(("asked", q)),
+        on_question_answered=lambda: events.append(("answered",)),
+    )
+
+    result = tb.dispatch("ask_human", {"question": "which port?"})
+
+    assert result == "42"
+    assert events == [("asked", "which port?"), ("answered",)]
+
+
+def test_ask_human_without_hooks_still_works(tmp_path, monkeypatch):
+    """Hooks are optional -- ToolBox constructed without them (as most
+    call sites do) must behave exactly as before."""
+    import autocoder.tools as tools_mod
+    monkeypatch.setattr(tools_mod, "ask_human_question", lambda q: "fine")
+    tb, ws = make_toolbox(tmp_path)
+    assert tb.dispatch("ask_human", {"question": "ok?"}) == "fine"
+
+
+def test_git_clean_with_x_flag_needs_confirmation_even_in_auto_mode(tmp_path, monkeypatch):
+    """
+    Reproduces the real crash: under approval mode 'auto', git clean -fdx
+    used to run completely unchecked, silently deleting the harness's own
+    .autocoder/ session-state directory (gitignored, but -x removes
+    gitignored files too). Must now force confirmation even under 'auto',
+    same override pattern as a workspace-escape attempt.
+    """
+    ws = Workspace.create(tmp_path / "ws", source_repo=None)
+    cfg = Config(workspace_root=ws.root, approval=ApprovalPolicy(mode="auto"))
+    confirmations = []
+
+    def fake_confirm(command, decision):
+        confirmations.append((command, decision.reason))
+        return False  # deny it -- proves the command didn't run unchecked
+
+    tb = ToolBox(ws, cfg, on_command_needs_approval=fake_confirm)
+    (ws.root / ".autocoder").mkdir(exist_ok=True)
+    (ws.root / ".autocoder" / "session.json").write_text("{}")
+
+    result = tb.run_gated_command("git clean -fdx", timeout=10)
+
+    assert len(confirmations) == 1
+    assert "gitignored" in confirmations[0][1]
+    assert result.exit_code == 1
+    assert "DENIED" in result.stderr
+    # the state directory survived because the command was never run
+    assert (ws.root / ".autocoder" / "session.json").exists()
+
+
+def test_git_clean_without_x_flag_still_auto_approved(tmp_path):
+    """A plain git clean -fd (no -x) doesn't touch gitignored files, so
+    'auto' mode should still let it through without confirmation, same as
+    before this fix."""
+    ws = Workspace.create(tmp_path / "ws", source_repo=None)
+    cfg = Config(workspace_root=ws.root, approval=ApprovalPolicy(mode="auto"))
+    tb = ToolBox(ws, cfg, on_command_needs_approval=lambda c, d: (_ for _ in ()).throw(
+        AssertionError("should not need confirmation")))
+
+    result = tb.run_gated_command("git status", timeout=10)
+    assert result.exit_code == 0

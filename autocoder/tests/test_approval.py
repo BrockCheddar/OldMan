@@ -97,3 +97,17 @@ def test_auto_mode_never_confirms_even_unsafe_commands():
 def test_ask_mode_always_confirms_even_safe_commands():
     d = classify_command("pytest -q", ApprovalPolicy(mode="ask"))
     assert d.needs_confirmation
+
+
+def test_git_clean_with_x_flag_is_flagged_as_state_wipe_risk():
+    from autocoder.approval import detect_state_directory_wipe_risk
+    assert detect_state_directory_wipe_risk("git clean -fdx") is not None
+    assert detect_state_directory_wipe_risk("git clean -x -f -d") is not None
+    assert detect_state_directory_wipe_risk("git clean -fdx && git status") is not None
+
+
+def test_git_clean_without_x_flag_is_not_flagged():
+    from autocoder.approval import detect_state_directory_wipe_risk
+    assert detect_state_directory_wipe_risk("git clean -fd") is None
+    assert detect_state_directory_wipe_risk("git status") is None
+    assert detect_state_directory_wipe_risk("git commit -m 'fix'") is None

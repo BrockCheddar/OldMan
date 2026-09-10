@@ -1668,3 +1668,934 @@ def test_resume_gives_a_fresh_replan_budget_for_the_next_step(tmp_path):
 
     assert state2.status == "done"
     assert len(state2.completed_steps) == 2
+
+
+def test_total_token_budget_exceeded_mid_attempt_reverts_and_escalates(tmp_path, monkeypatch):
+    """
+    Regression: record_usage's BudgetExceeded (the max_total_tokens ceiling)
+    fires deep inside _call_llm. It used to have no local catch in
+    _inner_loop's attempt loop, so it propagated straight out uncaught --
+    no revert, no replan chance -- instead of going through the same
+    attempts/derailed_attempts -> replan -> escalate funnel the step-count
+    budget already used. This confirms it's now caught, reverted, and
+    funneled the same way, ending in a clean escalation rather than a crash.
+    """
+    llm = FakeLLMClient([
+        tool_response("propose_step", {
+            "title": "Some step",
+            "acceptance_command": "python -c \"pass\"",
+        }),
+        # attempt 1: consumed by FakeLLMClient, but record_usage raises
+        # BudgetExceeded before agent.py ever sees this response
+        tool_response("write_file", {"path": "x.py", "content": "1"}, call_id="i1"),
+        # replan pass (planner_llm.complete bypasses record_usage entirely)
+        text_response("OBJECTIVE: same\nACCEPTANCE_COMMAND: python -c \"pass\""),
+        # attempt 2 (post-replan): total tokens are already over the cap
+        # permanently, so this also trips BudgetExceeded
+        tool_response("write_file", {"path": "x.py", "content": "1"}, call_id="i2"),
+    ])
+    monkeypatch.setattr("builtins.input", lambda prompt="": "abort")
+    cfg = make_config(tmp_path, max_subtask_attempts=1, max_replan_cycles=1, max_total_tokens=25)
+    agent = Agent(cfg, llm=llm)
+
+    from autocoder.agent import AgentAborted
+    import pytest
+    with pytest.raises(AgentAborted):
+        agent.run(goal="g", resume=False)
+
+    events = [json.loads(line) for line in agent.config.log_file.read_text().splitlines()]
+    assert any(e["kind"] == "total_token_budget_exceeded" for e in events)
+    assert any(e["kind"] == "replan_triggered" for e in events)
+    # workspace has no leftover half-applied edit from the aborted attempts
+    assert not (cfg.workspace_root / "x.py").exists()
+
+
+def test_goal_decomposition_set_and_check_off(tmp_path):
+    """
+    FLAW 9: set_goal_decomposition creates a durable structure (not a
+    re-interpretation of the goal string), and check_off_subtask flips one
+    entry without disturbing the rest. Both persist to session state.
+    """
+    llm = FakeLLMClient([
+        tool_response("set_goal_decomposition", {
+            "subtasks": ["Add the model", "Add the CLI", "Add tests"],
+        }),
+    ])
+    cfg = make_config(tmp_path)
+    agent = Agent(cfg, llm=llm)
+    from autocoder.planner import RunState
+    state = RunState(goal="g")
+    state.status = "running"
+    try:
+        agent._outer_loop(state, final_acceptance_command=None)
+    except AssertionError:
+        pass  # FakeLLMClient ran out of scripted responses -- expected, loop stop signal
+
+    assert len(state.decomposition.subtasks) == 3
+    assert all(s.status == "pending" for s in state.decomposition.subtasks)
+    first_id = state.decomposition.subtasks[0].id
+
+    # Now check one off via a fresh agent/llm sharing the same state
+    llm2 = FakeLLMClient([
+        tool_response("check_off_subtask", {"id": first_id}),
+    ])
+    agent2 = Agent(cfg, llm=llm2)
+    try:
+        agent2._outer_loop(state, final_acceptance_command=None)
+    except AssertionError:
+        pass
+
+    done = [s for s in state.decomposition.subtasks if s.status == "done"]
+    assert len(done) == 1
+    assert done[0].id == first_id
+    # persisted to disk, not just in memory
+    reloaded = agent2.session.load_state()
+    reloaded_done = [s for s in reloaded.decomposition.subtasks if s.status == "done"]
+    assert len(reloaded_done) == 1
+
+    # Real gap, found by comparing an actual successful run's events.jsonl
+    # against its session.json: check_off_subtask had no log_event call,
+    # so a real run where it worked exactly as intended was
+    # indistinguishable in the event log from one where nothing ever
+    # checked anything off -- the two other decomposition-mutating tools
+    # (set_goal_decomposition, strengthen_step_check) both already logged;
+    # this one silently didn't.
+    events = [json.loads(line) for line in agent2.config.log_file.read_text().splitlines()]
+    checkoffs = [e for e in events if e["kind"] == "subtask_checked_off"]
+    assert len(checkoffs) == 1
+    assert checkoffs[0]["id"] == first_id
+
+
+def test_check_off_unknown_subtask_id_returns_error_not_crash(tmp_path):
+    llm = FakeLLMClient([
+        tool_response("check_off_subtask", {"id": "nonexistent"}),
+    ])
+    cfg = make_config(tmp_path)
+    agent = Agent(cfg, llm=llm)
+    from autocoder.planner import RunState
+    state = RunState(goal="g")
+    try:
+        agent._outer_loop(state, final_acceptance_command=None)
+    except AssertionError:
+        pass
+    # no crash, and nothing was marked done
+    assert all(s.status == "pending" for s in state.decomposition.subtasks)
+
+
+def test_reopen_flips_done_session_back_to_running_and_preserves_history(tmp_path):
+    """
+    FLAW 1: declare_done used to be a true dead end -- resuming a "done"
+    session was a silent no-op (the outer loop's while-guard never runs).
+    reopen() must flip status back to running, add a durable subtask for
+    the new instructions, and keep every previously completed step intact.
+    """
+    from autocoder.planner import RunState, CompletedStep
+
+    cfg = make_config(tmp_path)
+    agent = Agent(cfg, llm=FakeLLMClient([]))
+    state = RunState(goal="build a thing")
+    state.completed_steps.append(CompletedStep(1, "did x", "did x", "true", "", "", 0))
+    state.status = "done"
+    agent.session.save_state(state)
+
+    reopened = agent.reopen("actually, the CLI is missing a --version flag")
+
+    assert reopened.status == "running"
+    assert "build a thing" in reopened.goal
+    assert "--version flag" in reopened.goal
+    assert len(reopened.completed_steps) == 1  # untouched
+    assert any("--version flag" in s.title for s in reopened.decomposition.subtasks)
+    assert all(s.status == "pending" for s in reopened.decomposition.subtasks)
+
+    # persisted, not just in memory
+    on_disk = agent.session.load_state()
+    assert on_disk.status == "running"
+
+
+def test_reopen_refuses_a_still_running_session(tmp_path):
+    from autocoder.planner import RunState
+    cfg = make_config(tmp_path)
+    agent = Agent(cfg, llm=FakeLLMClient([]))
+    state = RunState(goal="g")
+    state.status = "running"
+    agent.session.save_state(state)
+
+    import pytest
+    with pytest.raises(ValueError):
+        agent.reopen("more work")
+
+
+def test_reopen_with_no_existing_session_raises(tmp_path):
+    cfg = make_config(tmp_path)
+    agent = Agent(cfg, llm=FakeLLMClient([]))
+    import pytest
+    with pytest.raises(ValueError):
+        agent.reopen("more work")
+
+
+def test_self_audit_runs_after_n_steps_and_updates_decomposition_and_scratchpad(tmp_path):
+    """
+    FLAW 8 + 14: after self_audit_every_n_steps completed steps, a
+    dedicated planner pass runs, can add a new subtask, and replaces the
+    scratchpad with its distilled note.
+    """
+    llm = FakeLLMClient([
+        tool_response("propose_step", {
+            "title": "Create hello.py",
+            "acceptance_command": "python -m py_compile hello.py",
+        }),
+        tool_response("write_file", {"path": "hello.py", "content": "print('hi')\n"}, call_id="i1"),
+        tool_response("mark_step_done", {"summary": "wrote hello.py"}, call_id="i2"),
+        # self-audit pass (planner_llm == llm here, consumed in order)
+        text_response("ON_TRACK: no\nNEW_SUBTASK: double-check imports\nSATISFIED_SUBTASKS: NONE\nNOTE: hello.py exists; check imports next."),
+        tool_response("declare_done", {"summary": "all done"}, call_id="o2"),
+    ])
+    cfg = make_config(tmp_path, self_audit_every_n_steps=1)
+    agent = Agent(cfg, llm=llm)
+    state = agent.run(goal="build hello", resume=False, final_acceptance_command="python -m py_compile hello.py")
+
+    assert state.status == "done"
+    assert any(s.title == "double-check imports" for s in state.decomposition.subtasks)
+    assert "hello.py exists; check imports next." in state.scratchpad
+    assert "drifted" in state.scratchpad.lower()  # ON_TRACK: no -> drift prefix added
+
+    events = [json.loads(line) for line in agent.config.log_file.read_text().splitlines()]
+    audit_events = [e for e in events if e["kind"] == "self_audit"]
+    assert len(audit_events) == 1
+    assert audit_events[0]["on_track"] is False
+
+
+def test_self_audit_disabled_when_set_to_zero(tmp_path):
+    llm = FakeLLMClient([
+        tool_response("propose_step", {
+            "title": "Create hello.py",
+            "acceptance_command": "python -m py_compile hello.py",
+        }),
+        tool_response("write_file", {"path": "hello.py", "content": "print('hi')\n"}, call_id="i1"),
+        tool_response("mark_step_done", {"summary": "wrote hello.py"}, call_id="i2"),
+        # no self-audit response scripted -- if it fired, this would be
+        # consumed by it instead of declare_done, and the test would fail
+        tool_response("declare_done", {"summary": "all done"}, call_id="o2"),
+    ])
+    cfg = make_config(tmp_path, self_audit_every_n_steps=0)
+    agent = Agent(cfg, llm=llm)
+    state = agent.run(goal="build hello", resume=False, final_acceptance_command="python -m py_compile hello.py")
+
+    assert state.status == "done"
+    events = [json.loads(line) for line in agent.config.log_file.read_text().splitlines()]
+    assert not [e for e in events if e["kind"] == "self_audit"]
+
+
+def test_self_audit_llm_error_is_non_fatal(tmp_path):
+    from autocoder.llm import LLMError
+    llm = FakeLLMClient([
+        tool_response("propose_step", {
+            "title": "Create hello.py",
+            "acceptance_command": "python -m py_compile hello.py",
+        }),
+        tool_response("write_file", {"path": "hello.py", "content": "print('hi')\n"}, call_id="i1"),
+        tool_response("mark_step_done", {"summary": "wrote hello.py"}, call_id="i2"),
+        LLMError("planner backend down"),
+        tool_response("declare_done", {"summary": "all done"}, call_id="o2"),
+    ])
+    cfg = make_config(tmp_path, self_audit_every_n_steps=1)
+    agent = Agent(cfg, llm=llm)
+    state = agent.run(goal="build hello", resume=False, final_acceptance_command="python -m py_compile hello.py")
+
+    assert state.status == "done"  # run completes despite the audit pass failing
+    events = [json.loads(line) for line in agent.config.log_file.read_text().splitlines()]
+    assert any(e["kind"] == "self_audit_llm_error" for e in events)
+
+
+def test_parse_self_audit_response_basic():
+    from autocoder.agent import _parse_self_audit_response
+    on_track, new_subtask, note, satisfied = _parse_self_audit_response(
+        "ON_TRACK: yes\nNEW_SUBTASK: NONE\nSATISFIED_SUBTASKS: NONE\nNOTE: all good so far"
+    )
+    assert on_track is True
+    assert new_subtask == ""
+    assert note == "all good so far"
+    assert satisfied == []
+
+
+def test_parse_self_audit_response_drift_and_subtask():
+    from autocoder.agent import _parse_self_audit_response
+    on_track, new_subtask, note, satisfied = _parse_self_audit_response(
+        "ON_TRACK: no\nNEW_SUBTASK: add missing tests\nSATISFIED_SUBTASKS: NONE\nNOTE: line one\nline two"
+    )
+    assert on_track is False
+    assert new_subtask == "add missing tests"
+    assert note == "line one\nline two"
+    assert satisfied == []
+
+
+def test_parse_self_audit_response_malformed_defaults_to_on_track():
+    from autocoder.agent import _parse_self_audit_response
+    on_track, new_subtask, note, satisfied = _parse_self_audit_response("garbage, no labels at all")
+    assert on_track is True
+    assert new_subtask == ""
+    assert note == ""
+    assert satisfied == []
+
+
+def test_parse_self_audit_response_satisfied_subtasks():
+    from autocoder.agent import _parse_self_audit_response
+    on_track, new_subtask, note, satisfied = _parse_self_audit_response(
+        "ON_TRACK: yes\nNEW_SUBTASK: NONE\nSATISFIED_SUBTASKS: a1b2c3d4, e5f6g7h8\nNOTE: progress"
+    )
+    assert satisfied == ["a1b2c3d4", "e5f6g7h8"]
+
+
+def test_pending_question_persists_before_answer_and_survives_a_crash(tmp_path, monkeypatch):
+    """
+    FLAW 7: the whole point -- if the process is killed while blocked
+    waiting on ask_human's input(), the question must already be on disk
+    (persisted BEFORE the blocking call, not after). Simulates that by
+    having the fake human input raise mid-question (like a killed
+    process) and confirming state.pending_question survived the "crash".
+    """
+    def crashes_mid_question(prompt=""):
+        raise KeyboardInterrupt("simulated kill while waiting for input")
+
+    monkeypatch.setattr("builtins.input", crashes_mid_question)
+
+    llm = FakeLLMClient([
+        tool_response("ask_human", {"question": "which database should I use?"}),
+    ])
+    cfg = make_config(tmp_path)
+    agent = Agent(cfg, llm=llm)
+
+    # ask_human_question's input() raises KeyboardInterrupt mid-question --
+    # run() already handles that gracefully (existing Ctrl-C path: saves
+    # state, returns). The real assertion here is that the question was
+    # already ON DISK by the time that happened -- persisted before the
+    # blocking call, not only after a (never-arriving) answer.
+    result = agent.run(goal="build a thing", resume=False, final_acceptance_command=None)
+
+    assert result.pending_question == "which database should I use?"
+    on_disk = agent.session.load_state()
+    assert on_disk.pending_question == "which database should I use?"
+
+    events = [json.loads(line) for line in agent.config.log_file.read_text().splitlines()]
+    assert any(e["kind"] == "question_pending" for e in events)
+
+
+def test_resume_with_pending_question_reasks_and_records_answer(tmp_path, monkeypatch):
+    """
+    On resume, an orphaned pending_question must be re-asked (the original
+    in-memory context that asked it is gone), the answer folded into the
+    scratchpad so the model sees it next turn, and the flag cleared.
+    """
+    from autocoder.planner import RunState
+
+    monkeypatch.setattr("builtins.input", lambda prompt="": "postgres")
+
+    cfg = make_config(tmp_path)
+    agent = Agent(cfg, llm=FakeLLMClient([
+        tool_response("declare_done", {"summary": "done"}),
+    ]))
+    state = RunState(goal="build a thing")
+    state.pending_question = "which database should I use?"
+    agent.session.save_state(state)
+
+    result = agent.run(goal=None, resume=True, final_acceptance_command="true")
+
+    assert result.pending_question is None
+    assert "which database should I use?" in result.scratchpad
+    assert "postgres" in result.scratchpad
+
+    events = [json.loads(line) for line in agent.config.log_file.read_text().splitlines()]
+    assert any(e["kind"] == "pending_question_resolved_on_resume" for e in events)
+
+
+def test_strengthen_step_check_adds_command_and_regression_check_runs_it(tmp_path):
+    """
+    FLAW 2: a completed step's original acceptance_command only proves the
+    property it was written to prove. strengthen_step_check lets a later
+    part of the run attach a further command to it; from then on the
+    regression check (run at declare_done) must run BOTH.
+    """
+    llm = FakeLLMClient([
+        tool_response("propose_step", {
+            "title": "Add add()",
+            "acceptance_command": "python -c \"import calc; assert calc.add(2,3)==5\"",
+        }),
+        tool_response("write_file", {
+            "path": "calc.py",
+            "content": "def add(a, b):\n    return a + b\n",
+        }, call_id="i1"),
+        tool_response("mark_step_done", {"summary": "added add()"}, call_id="i2"),
+        # discover the gap: original check never covered negative numbers
+        tool_response("strengthen_step_check", {
+            "step_index": 1,
+            "additional_command": "python -c \"import calc; assert calc.add(-2,-3)==-5\"",
+            "reason": "later step relies on add() handling negatives",
+        }),
+        tool_response("declare_done", {"summary": "done"}, call_id="o2"),
+    ])
+    cfg = make_config(tmp_path, self_audit_every_n_steps=0)
+    agent = Agent(cfg, llm=llm)
+    state = agent.run(
+        goal="build calc", resume=False,
+        final_acceptance_command="python -c \"import calc; assert calc.add(1,1)==2\"",
+    )
+
+    assert state.status == "done"
+    step = state.completed_steps[0]
+    assert step.additional_checks == ["python -c \"import calc; assert calc.add(-2,-3)==-5\""]
+
+    events = [json.loads(line) for line in agent.config.log_file.read_text().splitlines()]
+    assert any(e["kind"] == "step_check_strengthened" for e in events)
+
+
+def test_strengthened_check_that_now_fails_is_caught_by_verify_done(tmp_path):
+    """The whole point: if the additional check would actually fail, the
+    regression check must catch it, not just the original command."""
+    from autocoder.planner import RunState, CompletedStep
+
+    cfg = make_config(tmp_path)
+    agent = Agent(cfg, llm=FakeLLMClient([]))
+    workspace_root = cfg.workspace_root
+    (workspace_root / "calc.py").write_text("def half(x):\n    return x // 2\n")
+
+    state = RunState(goal="build calc")
+    step = CompletedStep(
+        1, "Add half()", "added half()",
+        "python -c \"import calc; assert calc.half(4)==2\"", "", "", 0,
+    )
+    # discovered later: half() should support non-integer results, but
+    # the implementation truncates -- this additional check WILL fail
+    step.additional_checks.append("python -c \"import calc; assert calc.half(5)==2.5\"")
+    state.completed_steps.append(step)
+
+    accepted, feedback = agent._verify_done(state, "done", final_acceptance_command="true")
+    assert accepted is False
+    assert "half(5)==2.5" in feedback
+
+
+def test_strengthen_step_check_rejects_unknown_step_index(tmp_path):
+    llm = FakeLLMClient([
+        tool_response("strengthen_step_check", {
+            "step_index": 99,
+            "additional_command": "true",
+            "reason": "x",
+        }),
+    ])
+    cfg = make_config(tmp_path)
+    agent = Agent(cfg, llm=llm)
+    from autocoder.planner import RunState
+    state = RunState(goal="g")
+    try:
+        agent._outer_loop(state, final_acceptance_command=None)
+    except AssertionError:
+        pass
+    assert state.completed_steps == []
+
+
+def test_check_no_regressions_runs_additional_checks_too(tmp_path):
+    from autocoder.planner import RunState, CompletedStep
+    cfg = make_config(tmp_path)
+    agent = Agent(cfg, llm=FakeLLMClient([]))
+    state = RunState(goal="g")
+    step = CompletedStep(1, "t", "s", "true", "", "", 0)
+    step.additional_checks.append("false")  # deliberately failing
+    state.completed_steps.append(step)
+
+    feedback = agent._check_no_regressions(state)
+    assert feedback is not None
+    assert "step 1" in feedback
+    assert "false" in feedback
+
+
+def test_check_no_regressions_passes_when_all_checks_pass(tmp_path):
+    from autocoder.planner import RunState, CompletedStep
+    cfg = make_config(tmp_path)
+    agent = Agent(cfg, llm=FakeLLMClient([]))
+    state = RunState(goal="g")
+    step = CompletedStep(1, "t", "s", "true", "", "", 0)
+    step.additional_checks.append("true")
+    state.completed_steps.append(step)
+
+    assert agent._check_no_regressions(state) is None
+
+
+def test_self_audit_catches_regression_between_steps(tmp_path):
+    """
+    FLAW 2 + FLAW 8/14 synergy: the self-audit checkpoint also re-runs the
+    regression check, so a break introduced by a later step surfaces on
+    the model's next turn rather than only being discovered at
+    declare_done, however many more steps later that might be.
+    """
+    llm = FakeLLMClient([
+        tool_response("propose_step", {
+            "title": "Add add()",
+            "acceptance_command": "python -c \"import calc; assert calc.add(1,1)==2\"",
+        }),
+        tool_response("write_file", {"path": "calc.py", "content": "def add(a,b): return a+b\n"}, call_id="i1"),
+        tool_response("mark_step_done", {"summary": "added add()"}, call_id="i2"),
+        # self-audit fires here (self_audit_every_n_steps=1); planner_llm
+        # call is bypassed for regression -- but the file gets clobbered
+        # by the NEXT step before the audit, so script order matters:
+    ])
+    # Simpler and more direct: call _run_self_audit directly against a
+    # state whose completed step's file was since broken by hand -- avoids
+    # entangling this with the self-audit's own planner_llm response.
+    from autocoder.planner import RunState, CompletedStep
+    cfg = make_config(tmp_path, self_audit_every_n_steps=1)
+    agent = Agent(cfg, llm=FakeLLMClient([
+        text_response("ON_TRACK: yes\nNEW_SUBTASK: NONE\nSATISFIED_SUBTASKS: NONE\nNOTE: still on track"),
+    ]))
+    (cfg.workspace_root / "calc.py").write_text("def add(a, b): return a - b\n")  # broken
+    state = RunState(goal="build calc")
+    state.completed_steps.append(CompletedStep(
+        1, "Add add()", "added add()",
+        "python -c \"import calc; assert calc.add(1,1)==2\"", "", "", 0,
+    ))
+
+    agent._run_self_audit(state)
+
+    assert "Regression detected" in state.scratchpad
+    assert "drifted" in state.scratchpad.lower()
+    events = [json.loads(line) for line in agent.config.log_file.read_text().splitlines()]
+    assert any(e["kind"] == "self_audit_found_regression" for e in events)
+
+
+def test_export_then_import_into_fresh_workspace_restores_state(tmp_path):
+    from autocoder.planner import RunState, CompletedStep
+
+    src_cfg = make_config(tmp_path / "src")
+    src_agent = Agent(src_cfg, llm=FakeLLMClient([]))
+    state = RunState(goal="build a thing")
+    state.completed_steps.append(CompletedStep(1, "t", "s", "true", "", "", 0))
+    state.decomposition.replace(["part a"])
+    src_agent.session.save_state(state)
+    src_agent.lessons.add(context="x", symptom="crashed once", fix="added import")
+
+    bundle_path = tmp_path / "bundle.json"
+    bundle = src_agent.export_session(bundle_path)
+    assert bundle["schema_version"] == 1
+    assert bundle_path.exists()
+
+    dst_cfg = make_config(tmp_path / "dst")
+    dst_agent = Agent(dst_cfg, llm=FakeLLMClient([]))
+    assert dst_agent.session.load_state() is None  # fresh workspace, nothing yet
+
+    restored = dst_agent.import_session(bundle_path)
+    assert restored.goal == "build a thing"
+    assert len(restored.completed_steps) == 1
+    assert restored.decomposition.subtasks[0].title == "part a"
+
+    on_disk = dst_agent.session.load_state()
+    assert on_disk.goal == "build a thing"
+    imported_lessons = dst_agent.lessons.load()
+    assert any(l.symptom == "crashed once" for l in imported_lessons)
+
+
+def test_import_refuses_to_clobber_existing_session_without_force(tmp_path):
+    from autocoder.planner import RunState
+
+    src_cfg = make_config(tmp_path / "src")
+    src_agent = Agent(src_cfg, llm=FakeLLMClient([]))
+    src_agent.session.save_state(RunState(goal="source goal"))
+    bundle_path = tmp_path / "bundle.json"
+    src_agent.export_session(bundle_path)
+
+    dst_cfg = make_config(tmp_path / "dst")
+    dst_agent = Agent(dst_cfg, llm=FakeLLMClient([]))
+    dst_agent.session.save_state(RunState(goal="already running here"))
+
+    import pytest
+    with pytest.raises(ValueError):
+        dst_agent.import_session(bundle_path)
+
+    # unaffected without force
+    assert dst_agent.session.load_state().goal == "already running here"
+
+    # force overwrites
+    restored = dst_agent.import_session(bundle_path, force=True)
+    assert restored.goal == "source goal"
+
+
+def test_export_with_no_session_raises(tmp_path):
+    cfg = make_config(tmp_path)
+    agent = Agent(cfg, llm=FakeLLMClient([]))
+    import pytest
+    with pytest.raises(ValueError):
+        agent.export_session(tmp_path / "out.json")
+
+
+def test_import_warns_on_git_head_mismatch_but_still_imports(tmp_path, capsys):
+    from autocoder.planner import RunState
+
+    src_cfg = make_config(tmp_path / "src")
+    src_agent = Agent(src_cfg, llm=FakeLLMClient([]))
+    src_agent.session.save_state(RunState(goal="g"))
+    bundle_path = tmp_path / "bundle.json"
+    bundle = src_agent.export_session(bundle_path)
+    # tamper with the recorded head to force a mismatch
+    bundle["git_head"] = "0" * 40
+    bundle_path.write_text(json.dumps(bundle))
+
+    dst_cfg = make_config(tmp_path / "dst")
+    dst_agent = Agent(dst_cfg, llm=FakeLLMClient([]))
+    dst_agent.import_session(bundle_path)  # doesn't raise
+
+    assert "WARNING" in capsys.readouterr().out
+
+
+def test_import_lessons_merges_active_only_and_dedupes(tmp_path):
+    src_cfg = make_config(tmp_path / "src")
+    src_agent = Agent(src_cfg, llm=FakeLLMClient([]))
+    src_agent.lessons.add(context="x", symptom="old bug", fix="workaround")
+    first_id = src_agent.lessons.load()[0].id
+    src_agent.lessons.add(context="x", symptom="old bug", fix="real fix", supersedes=first_id)  # supersedes -> old inactive
+    src_agent.lessons.add(context="y", symptom="fresh one", fix="fresh fix")
+
+    dst_cfg = make_config(tmp_path / "dst")
+    dst_agent = Agent(dst_cfg, llm=FakeLLMClient([]))
+    dst_agent.lessons.add(context="z", symptom="fresh one", fix="fresh fix")  # already present
+
+    count = dst_agent.import_lessons(src_cfg.lessons_file)
+
+    dst_lessons = dst_agent.lessons.load()
+    symptoms = [l.symptom for l in dst_lessons]
+    assert "old bug" not in [l.symptom for l in dst_lessons if l.fix == "workaround"]  # inactive one skipped
+    assert symptoms.count("fresh one") == 1  # deduped, not added again
+    assert count == 1  # only "real fix" was genuinely new
+
+
+def test_inner_system_prompt_prefers_relevant_lesson_over_recent(tmp_path):
+    """
+    FLAW 13: a lesson matching the CURRENT step's actual problem should be
+    shown even if it's not the most recent one; an irrelevant-but-recent
+    lesson shouldn't crowd it out.
+    """
+    from autocoder.planner import RunState, StepContext
+
+    cfg = make_config(tmp_path)
+    agent = Agent(cfg, llm=FakeLLMClient([]))
+    agent.lessons.add(
+        context="step: parse CSV imports", symptom="pandas raised UnicodeDecodeError",
+        fix="opened with encoding='utf-8-sig'", intent="importing legacy CSV exports",
+    )
+    # recorded more recently, but about something unrelated
+    agent.lessons.add(context="step: send emails", symptom="SMTP auth failed", fix="used app password")
+
+    state = RunState(goal="import all the CSV files")
+    step_context = StepContext(
+        title="Parse the vendor CSV export",
+        objective="read the CSV file and decode it correctly",
+        acceptance_command="true",
+    )
+    prompt = agent._inner_system_prompt(state, step_context)
+
+    assert "UnicodeDecodeError" in prompt
+    assert "SMTP auth failed" not in prompt
+
+
+def test_inner_system_prompt_falls_back_to_recent_when_no_match(tmp_path):
+    from autocoder.planner import RunState, StepContext
+
+    cfg = make_config(tmp_path)
+    agent = Agent(cfg, llm=FakeLLMClient([]))
+    agent.lessons.add(context="step: send emails", symptom="SMTP auth failed", fix="used app password")
+
+    state = RunState(goal="g")
+    step_context = StepContext(
+        title="Completely unrelated topic entirely",
+        objective="something about image resizing pipelines",
+        acceptance_command="true",
+    )
+    prompt = agent._inner_system_prompt(state, step_context)
+
+    assert "SMTP auth failed" in prompt  # fallback to recent-N, not hidden
+
+
+def test_escalation_lesson_records_goal_as_intent(tmp_path, monkeypatch):
+    """FLAW 11: an escalation-derived lesson should record what the run
+    was actually trying to do (state.goal) as its intent."""
+    from autocoder.planner import RunState
+
+    monkeypatch.setattr("builtins.input", lambda prompt="": "just skip that check")
+    cfg = make_config(tmp_path)
+    agent = Agent(cfg, llm=FakeLLMClient([]))
+    state = RunState(goal="build a CLI tool for CSV import")
+
+    agent._escalate(state, "step kept failing acceptance check")
+    agent._finalize_pending_lesson(fix_summary="fixed after guidance")
+
+    lesson = agent.lessons.load()[0]
+    assert lesson.intent == "build a CLI tool for CSV import"
+
+
+def test_decomposition_hint_flags_pending_subtask_matched_by_completed_step(tmp_path):
+    """
+    Reproduces the real bug: a subtask stays 'pending' even after a
+    completed step clearly satisfies it, because nothing ever prompted
+    the model to reconcile the two. The reconciliation hint must surface
+    a '>>' nudge for it, visible on every outer turn.
+    """
+    from autocoder.planner import RunState, CompletedStep
+    from autocoder.agent import _decomposition_with_reconciliation_hints
+
+    state = RunState(goal="build a CLI tool")
+    state.decomposition.replace(["Implement the CLI commands: add, list, total-by-category"])
+    subtask_id = state.decomposition.subtasks[0].id
+    state.completed_steps.append(CompletedStep(
+        1, "Implement CLI commands (add, list, total-by-category)",
+        "added add/list/total-by-category subcommands", "true", "", "", 0,
+    ))
+
+    hint_text = _decomposition_with_reconciliation_hints(state)
+
+    assert f"({subtask_id})" in hint_text
+    assert "looks satisfied by completed step 1" in hint_text
+    assert "check_off_subtask" in hint_text
+
+
+def test_decomposition_hint_no_nudge_for_unrelated_completed_steps(tmp_path):
+    from autocoder.planner import RunState, CompletedStep
+    from autocoder.agent import _decomposition_with_reconciliation_hints
+
+    state = RunState(goal="g")
+    state.decomposition.replace(["Set up CI pipeline configuration"])
+    state.completed_steps.append(CompletedStep(
+        1, "Write the README", "documented usage", "true", "", "", 0,
+    ))
+
+    hint_text = _decomposition_with_reconciliation_hints(state)
+    assert "looks satisfied" not in hint_text
+
+
+def test_decomposition_hint_shows_done_items_checked(tmp_path):
+    from autocoder.planner import RunState
+    from autocoder.agent import _decomposition_with_reconciliation_hints
+
+    state = RunState(goal="g")
+    state.decomposition.replace(["part a"])
+    state.decomposition.subtasks[0].status = "done"
+
+    hint_text = _decomposition_with_reconciliation_hints(state)
+    assert "[x]" in hint_text
+    assert "looks satisfied" not in hint_text  # already done, no nudge needed
+
+
+def test_self_audit_reconciles_satisfied_subtasks(tmp_path):
+    """
+    Second layer of the fix: self-audit, as a dedicated review pass, can
+    directly check off a subtask it explicitly confirms is satisfied --
+    not just hope the outer-loop model notices the hint.
+    """
+    from autocoder.planner import RunState, CompletedStep
+
+    cfg = make_config(tmp_path, self_audit_every_n_steps=1)
+    state = RunState(goal="build a CLI tool")
+    state.decomposition.replace(["Implement the CLI commands"])
+    subtask_id = state.decomposition.subtasks[0].id
+    state.completed_steps.append(CompletedStep(
+        1, "Implement CLI commands", "done", "true", "", "", 0,
+    ))
+
+    agent = Agent(cfg, llm=FakeLLMClient([
+        text_response(
+            f"ON_TRACK: yes\nNEW_SUBTASK: NONE\nSATISFIED_SUBTASKS: {subtask_id}\nNOTE: CLI done"
+        ),
+    ]))
+    agent._run_self_audit(state)
+
+    assert state.decomposition.get(subtask_id).status == "done"
+    events = [json.loads(line) for line in agent.config.log_file.read_text().splitlines()]
+    assert any(e["kind"] == "self_audit_reconciled_subtasks" and e["ids"] == [subtask_id] for e in events)
+
+
+def test_self_audit_ignores_unknown_satisfied_subtask_id(tmp_path):
+    from autocoder.planner import RunState
+
+    cfg = make_config(tmp_path, self_audit_every_n_steps=1)
+    state = RunState(goal="g")
+    state.decomposition.replace(["part a"])
+
+    agent = Agent(cfg, llm=FakeLLMClient([
+        text_response("ON_TRACK: yes\nNEW_SUBTASK: NONE\nSATISFIED_SUBTASKS: nonexistent-id\nNOTE: x"),
+    ]))
+    agent._run_self_audit(state)  # must not raise
+
+    assert all(s.status == "pending" for s in state.decomposition.subtasks)
+
+
+def test_steps_look_like_repeats_detects_real_world_titles():
+    """Replays actual titles from a real run that thrashed for 27 of 35
+    steps on the same underlying regression."""
+    from autocoder.agent import _steps_look_like_repeats
+    from autocoder.planner import CompletedStep
+
+    def step(title):
+        return CompletedStep(1, title, "s", "true", "", "", 0)
+
+    assert _steps_look_like_repeats(
+        step("Fix data/expenses.csv duplicate row"),
+        step("Remove duplicate data row from data/expenses.csv"),
+    )
+    assert _steps_look_like_repeats(
+        step("Rewrite data/expenses.csv to exactly one data row"),
+        step("Trim data/expenses.csv to a single data row"),
+    )
+
+
+def test_steps_look_like_repeats_false_for_genuinely_different_work():
+    from autocoder.agent import _steps_look_like_repeats
+    from autocoder.planner import CompletedStep
+
+    def step(title):
+        return CompletedStep(1, title, "s", "true", "", "", 0)
+
+    assert not _steps_look_like_repeats(
+        step("Implement add expense CLI subcommand"),
+        step("Add tests covering add/list/total"),
+    )
+
+
+def test_three_consecutive_similar_steps_forces_escalation(tmp_path, monkeypatch):
+    """
+    Reproduces the real thrash: three near-identical 'fix the csv' steps
+    in a row must force an escalation instead of letting a fourth
+    near-identical step get proposed.
+    """
+    monkeypatch.setattr("builtins.input", lambda prompt="": "abort")
+    llm = FakeLLMClient([
+        tool_response("propose_step", {"title": "Fix data/expenses.csv duplicate row", "acceptance_command": "true"}),
+        tool_response("mark_step_done", {"summary": "fixed"}, call_id="i1"),
+        tool_response("propose_step", {"title": "Remove duplicate data row from expenses.csv", "acceptance_command": "true"}),
+        tool_response("mark_step_done", {"summary": "fixed again"}, call_id="i2"),
+        tool_response("propose_step", {"title": "Rewrite expenses.csv to a single data row", "acceptance_command": "true"}),
+        tool_response("mark_step_done", {"summary": "fixed a third time"}, call_id="i3"),
+        # a 4th near-identical step should never get proposed -- escalation
+        # fires and aborts on "abort" before this response would be used
+    ])
+    cfg = make_config(tmp_path, self_audit_every_n_steps=0)
+    agent = Agent(cfg, llm=llm)
+
+    from autocoder.agent import AgentAborted
+    with __import__("pytest").raises(AgentAborted):
+        agent.run(goal="build calc", resume=False, final_acceptance_command=None)
+
+    on_disk = agent.session.load_state()
+    assert len(on_disk.completed_steps) == 3  # stopped after the 3rd, didn't propose a 4th
+    events = [json.loads(line) for line in agent.config.log_file.read_text().splitlines()]
+    escalations = [e for e in events if e["kind"] == "consecutive_similar_steps_escalated"]
+    assert len(escalations) == 1
+    assert len(escalations[0]["titles"]) == 3
+
+
+def test_dissimilar_steps_never_trigger_escalation(tmp_path):
+    """Sanity check: three genuinely different steps in a row must not
+    false-positive into an escalation."""
+    llm = FakeLLMClient([
+        tool_response("propose_step", {"title": "Implement add expense CLI subcommand", "acceptance_command": "true"}),
+        tool_response("mark_step_done", {"summary": "done"}, call_id="i1"),
+        tool_response("propose_step", {"title": "Implement list expenses CLI subcommand", "acceptance_command": "true"}),
+        tool_response("mark_step_done", {"summary": "done"}, call_id="i2"),
+        tool_response("propose_step", {"title": "Add tests covering add and list", "acceptance_command": "true"}),
+        tool_response("mark_step_done", {"summary": "done"}, call_id="i3"),
+        tool_response("declare_done", {"summary": "all done"}, call_id="o4"),
+    ])
+    cfg = make_config(tmp_path, self_audit_every_n_steps=0)
+    agent = Agent(cfg, llm=llm)
+    state = agent.run(goal="build cli", resume=False, final_acceptance_command="true")
+
+    assert state.status == "done"
+    events = [json.loads(line) for line in agent.config.log_file.read_text().splitlines()]
+    assert not [e for e in events if e["kind"] == "consecutive_similar_steps_escalated"]
+
+
+def test_set_goal_decomposition_preserves_progress_across_redeclare(tmp_path):
+    """Real bug fix: re-calling set_goal_decomposition mid-run (e.g. to
+    add a genuinely new item) must not wipe already-checked-off progress
+    on items whose titles are repeated verbatim."""
+    llm = FakeLLMClient([
+        tool_response("set_goal_decomposition", {"subtasks": ["Part A", "Part B"]}),
+    ])
+    cfg = make_config(tmp_path)
+    agent = Agent(cfg, llm=llm)
+    from autocoder.planner import RunState
+    state = RunState(goal="g")
+    try:
+        agent._outer_loop(state, final_acceptance_command=None)
+    except AssertionError:
+        pass
+    state.decomposition.subtasks[0].status = "done"
+    part_a_id = state.decomposition.subtasks[0].id
+
+    llm2 = FakeLLMClient([
+        tool_response("set_goal_decomposition", {"subtasks": ["Part A", "Part B", "Part C"]}),
+    ])
+    agent2 = Agent(cfg, llm=llm2)
+    try:
+        agent2._outer_loop(state, final_acceptance_command=None)
+    except AssertionError:
+        pass
+
+    by_title = {s.title: s for s in state.decomposition.subtasks}
+    assert by_title["Part A"].status == "done"
+    assert by_title["Part A"].id == part_a_id
+    assert by_title["Part B"].status == "pending"
+    assert by_title["Part C"].status == "pending"
+
+    events = [json.loads(line) for line in agent2.config.log_file.read_text().splitlines()]
+    decomp_events = [e for e in events if e["kind"] == "goal_decomposition_set"]
+    assert decomp_events[-1]["preserved"] == 2
+    assert decomp_events[-1]["added"] == 1
+
+
+def test_declare_done_reconciles_pending_subtasks_that_match_completed_work(tmp_path):
+    """
+    Real bug: the model declared the goal done saying 'three items
+    complete' while the tracked breakdown had four, two still pending
+    despite matching completed work almost exactly -- because the
+    reconciliation hint only suggests, it doesn't act. This sweep is the
+    backstop, applied unconditionally at declare_done regardless of
+    accept/reject outcome.
+    """
+    from autocoder.planner import RunState, CompletedStep
+
+    cfg = make_config(tmp_path)
+    agent = Agent(cfg, llm=FakeLLMClient([]))
+    state = RunState(goal="build a cli tool")
+    state.decomposition.replace([
+        "Implement the core generator",
+        "Add a test suite covering the core behavior",
+    ])
+    state.completed_steps.append(CompletedStep(
+        1, "Implement the core generator", "done", "true", "", "", 0,
+    ))
+    state.completed_steps.append(CompletedStep(
+        2, "Add test suite covering core behavior", "done", "true", "", "", 0,
+    ))
+
+    accepted, feedback = agent._verify_done(state, "done", final_acceptance_command="true")
+
+    assert accepted is True
+    assert all(s.status == "done" for s in state.decomposition.subtasks)
+    events = [json.loads(line) for line in agent.config.log_file.read_text().splitlines()]
+    reconciled = [e for e in events if e["kind"] == "declare_done_reconciled_subtasks"]
+    assert len(reconciled) == 1
+    assert len(reconciled[0]["ids"]) == 2
+
+
+def test_declare_done_reconciliation_does_not_fire_for_unrelated_pending_items(tmp_path):
+    from autocoder.planner import RunState, CompletedStep
+
+    cfg = make_config(tmp_path)
+    agent = Agent(cfg, llm=FakeLLMClient([]))
+    state = RunState(goal="g")
+    state.decomposition.replace(["Set up CI pipeline configuration"])
+    state.completed_steps.append(CompletedStep(
+        1, "Write the README", "documented usage", "true", "", "", 0,
+    ))
+
+    agent._verify_done(state, "done", final_acceptance_command="true")
+
+    assert state.decomposition.subtasks[0].status == "pending"
+    if agent.config.log_file.exists():
+        events = [json.loads(line) for line in agent.config.log_file.read_text().splitlines()]
+        assert not [e for e in events if e["kind"] == "declare_done_reconciled_subtasks"]

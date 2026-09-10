@@ -62,3 +62,99 @@ def test_load_survives_corrupted_file(tmp_path):
     path.write_text("not valid json{{{", encoding="utf-8")
     store = LessonsStore(path)
     assert store.load() == []  # doesn't crash, just treats as empty
+
+
+def test_new_lesson_gets_an_id_and_is_active(tmp_path):
+    store = LessonsStore(tmp_path / ".autocoder" / "lessons.json")
+    store.add(context="x", symptom="crashed", fix="added import")
+    lessons = store.load()
+    assert lessons[0].active is True
+    assert lessons[0].id  # non-empty
+
+
+def test_supersede_by_id_deactivates_old_and_hides_from_summary(tmp_path):
+    store = LessonsStore(tmp_path / ".autocoder" / "lessons.json")
+    store.add(context="x", symptom="old bug", fix="workaround")
+    first_id = store.load()[0].id
+    store.add(context="x", symptom="old bug", fix="real fix", supersedes=first_id)
+
+    lessons = {l.id: l for l in store.load()}
+    assert lessons[first_id].active is False
+    assert len(lessons) == 2  # full history preserved on disk
+
+    text = store.summary_text()
+    assert "real fix" in text
+    assert "workaround" not in text
+
+
+def test_supersede_with_unknown_id_does_not_deactivate_anything(tmp_path):
+    store = LessonsStore(tmp_path / ".autocoder" / "lessons.json")
+    store.add(context="x", symptom="a", fix="b")
+    store.add(context="x", symptom="c", fix="d", supersedes="nonexistent-id")
+    lessons = store.load()
+    assert all(l.active for l in lessons)
+    assert lessons[-1].supersedes is None
+
+
+def test_cap_evicts_inactive_before_touching_active(tmp_path):
+    store = LessonsStore(tmp_path / ".autocoder" / "lessons.json")
+    kept_symptom = "load-bearing lesson, never superseded"
+    store.add(context="x", symptom=kept_symptom, fix="fix")
+    prev_id = None
+    for i in range(MAX_LESSONS_STORED + 5):
+        store.add(context="x", symptom=f"noise{i}", fix=f"fix{i}", supersedes=prev_id)
+        prev_id = store.load()[-1].id
+    lessons = store.load()
+    assert len(lessons) == MAX_LESSONS_STORED
+    assert any(l.active and l.symptom == kept_symptom for l in lessons)
+
+
+def test_add_stores_intent_and_render_includes_it(tmp_path):
+    store = LessonsStore(tmp_path / ".autocoder" / "lessons.json")
+    store.add(context="x", symptom="import error", fix="added __init__.py",
+              intent="building the contact-book package layout")
+    lesson = store.load()[0]
+    assert lesson.intent == "building the contact-book package layout"
+    text = store.summary_text()
+    assert "building the contact-book package layout" in text
+
+
+def test_find_relevant_matches_on_keyword_overlap(tmp_path):
+    store = LessonsStore(tmp_path / ".autocoder" / "lessons.json")
+    store.add(context="step: parse CSV files", symptom="pandas raised a UnicodeDecodeError",
+              fix="opened with encoding='utf-8-sig'", intent="importing legacy CSV exports")
+    store.add(context="step: send emails", symptom="SMTP auth failed",
+              fix="used an app password instead", intent="notifying users")
+
+    matches = store.find_relevant("parsing a CSV file that raises decode errors")
+    assert len(matches) == 1
+    assert matches[0].symptom == "pandas raised a UnicodeDecodeError"
+
+
+def test_find_relevant_returns_empty_when_nothing_matches(tmp_path):
+    store = LessonsStore(tmp_path / ".autocoder" / "lessons.json")
+    store.add(context="x", symptom="totally unrelated database migration issue", fix="ran alembic upgrade")
+    assert store.find_relevant("completely different topic about image resizing") == []
+
+
+def test_find_relevant_ignores_inactive_lessons(tmp_path):
+    store = LessonsStore(tmp_path / ".autocoder" / "lessons.json")
+    store.add(context="x", symptom="csv parsing encoding error", fix="old fix")
+    old_id = store.load()[0].id
+    store.add(context="x", symptom="csv parsing encoding error", fix="better fix", supersedes=old_id)
+
+    matches = store.find_relevant("csv parsing encoding error")
+    assert len(matches) == 1
+    assert matches[0].fix == "better fix"
+
+
+def test_find_relevant_ranks_higher_overlap_first(tmp_path):
+    store = LessonsStore(tmp_path / ".autocoder" / "lessons.json")
+    store.add(context="x", symptom="socket timeout connecting to redis cache", fix="fix a",
+              intent="caching layer")
+    store.add(context="x", symptom="redis cache eviction policy misconfigured causing timeout errors",
+              fix="fix b", intent="redis cache tuning")
+
+    matches = store.find_relevant("redis cache timeout errors during eviction")
+    assert len(matches) == 2
+    assert matches[0].fix == "fix b"  # more overlapping keywords
