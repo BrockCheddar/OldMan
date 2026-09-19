@@ -54,6 +54,27 @@ _EXPLORATION_LOG_MAX_ENTRIES = 8
 _EXPLORATION_ENTRY_CHAR_CAP = 1500
 _EXPLORATION_TOTAL_CHAR_CAP = 9000
 
+# ── condensation INPUT budget (separate from the exploration caps above) ──
+#
+# Real bug: _condense_batch used to reuse _render_exploration_log (and
+# therefore _EXPLORATION_ENTRY_CHAR_CAP/_EXPLORATION_TOTAL_CHAR_CAP) for its
+# own input. Those constants are sized for keeping the ALWAYS-VISIBLE,
+# every-turn prompt block cheap -- a completely different job from
+# condensation's dedicated, occasional, one-shot call whose entire purpose
+# is reading a lot of raw file content to produce a little. Reusing them
+# meant condensation could only ever see ~1500 chars of ANY file regardless
+# of size -- about 1% of a 150,000-char file -- regardless of how much real
+# context budget the model actually had to spare.
+#
+# This budget scales with the configured context window instead: a bigger
+# local context (or a hosted model with a much larger window) gets
+# proportionally more condensation coverage for free; a small context
+# degrades to (at worst) roughly the same flat floor condensation always
+# had, via _CONDENSATION_MIN_CHAR_BUDGET.
+_CHARS_PER_TOKEN_ESTIMATE = 3.0  # conservative -- code tokenizes ~3.5-4 chars/token
+_CONDENSATION_CONTEXT_FRACTION = 0.6  # leaves room for output tokens + backend overhead
+_CONDENSATION_MIN_CHAR_BUDGET = 9000  # never worse than the old flat cap
+
 # Total chars the "files in scope" block of a state report may spend on
 # live file content, and the floor given to any single file even when
 # there are many files in scope. Replaces a hard `files[:5]` cap that
@@ -95,6 +116,40 @@ def _parse_condensed_sections(text: str) -> dict[str, str]:
     if current_path is not None:
         sections[current_path] = "\n".join(current_lines).strip()
     return {path: note for path, note in sections.items() if note}
+
+
+def _render_batch_content_for_condensation(files: dict[str, str], char_budget: int) -> str:
+    """
+    Budget-driven allocation for condensation's input -- NOT a flat
+    per-entry cap like _render_exploration_log (which is built for the
+    cheap, always-visible per-turn prompt block; wrong tool for this job,
+    see the constants above).
+
+    Smallest-file-first: a small file gets its FULL content before a large
+    one gets anything, and whatever budget remains concentrates on the
+    larger file(s) -- so a 500-byte file and a 150,000-char file don't get
+    identically-sized slices regardless of size, which was the old bug.
+    A file that still doesn't fit in its share gets what fits plus a note
+    that it was cut for space (the caller is expected to route any file
+    that can't fit at ALL, even alone, to chunked condensation instead --
+    see _condense_large_file_in_chunks).
+    """
+    if not files or char_budget <= 0:
+        return ""
+    remaining_budget = char_budget
+    ordered = sorted(files.keys(), key=lambda p: len(files[p]))
+    kept: dict[str, str] = {}
+    for i, path in enumerate(ordered):
+        files_left = len(ordered) - i
+        share = max(1, remaining_budget // files_left)
+        content = files[path]
+        if len(content) <= share:
+            kept[path] = content
+            remaining_budget -= len(content)
+        else:
+            kept[path] = content[:share] + "\n[... cut for space in this batch]"
+            remaining_budget -= share
+    return "\n\n".join(f"--- {path} ---\n{kept[path]}" for path in ordered)
 
 
 def _render_exploration_log(exploration_log: list[tuple[str, str]] | None) -> str:
@@ -669,8 +724,96 @@ class Agent:
         state.auto_read_log = combined
         self.session.save_state(state)
 
-    def _condense_batch(self, state: "RunState", touched_files: set[str],
-                         exploration_log: list[tuple[str, str]]) -> None:
+    def _condensation_char_budget(self) -> int:
+        """See the constants block near the top of this file for why this
+        exists as its own scaled function instead of reusing the
+        exploration-log render caps."""
+        context_tokens = self.config.llm.context_window_tokens or 0
+        scaled = int(context_tokens * _CHARS_PER_TOKEN_ESTIMATE * _CONDENSATION_CONTEXT_FRACTION)
+        return max(_CONDENSATION_MIN_CHAR_BUDGET, scaled)
+
+    def _read_file_for_condensation(self, path: str) -> str | None:
+        """
+        Reads a file DIRECTLY off disk for condensation's internal use --
+        deliberately bypassing the read_file TOOL and its
+        MAX_READ_FILE_CHARS cap. That cap exists to keep any single
+        model-facing tool_result small enough to page through one turn at
+        a time; condensation is a harness-internal mechanism with its own
+        separate, purpose-built size handling (this budget function plus
+        chunked condensation below), so routing it through the model-facing
+        tool would silently lose the tail of any file over 100,000 chars
+        before condensation ever got a chance to see it.
+
+        Returns None if the file no longer exists (deleted/moved since
+        being touched) -- callers are expected to drop it from
+        condensed_files in that case rather than describe a stale entry.
+        """
+        try:
+            return (self.workspace.root / path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+
+    def _condense_large_file_in_chunks(self, state: "RunState", path: str, full_content: str,
+                                        char_budget: int) -> None:
+        """
+        Fallback for a file that's too large to fit ANY condensation batch
+        even alone -- there's no context window large enough to make
+        "arbitrarily large" fit in one shot, no matter how generously
+        _condensation_char_budget scales. Condenses sequentially in
+        chunks, each call folding the new chunk into a running description
+        that supersedes the previous one, so file size is no longer a hard
+        ceiling on whether a file can be understood at all -- only on how
+        many extra LLM calls it costs to get there.
+
+        Best-effort like the batched path: an LLMError partway through
+        still saves whatever description was built from the chunks that
+        DID succeed (better than discarding real progress), clearly
+        logged as partial rather than silently presented as complete.
+        """
+        chunk_size = max(1000, char_budget // 2)  # other half reserved for the running description + template text
+        chunks = [full_content[i:i + chunk_size] for i in range(0, len(full_content), chunk_size)]
+        running_description = ""
+        completed_chunks = 0
+        system = (
+            "You are building a running description of ONE file, seen in "
+            "sequential chunks because it is too large for one pass. You will "
+            "be given the description built from EARLIER chunks (empty on the "
+            "first chunk) and the NEXT chunk of raw content. Produce an "
+            "UPDATED description reflecting the file as a whole so far -- "
+            "incorporate what's new, keep what's still accurate, drop nothing "
+            "important. Output ONLY the updated description, no preamble."
+        )
+        for i, chunk in enumerate(chunks):
+            user_text = (
+                f"Description so far ({i}/{len(chunks)} chunks processed):\n"
+                f"{running_description or '(none yet -- this is the first chunk)'}\n\n"
+                f"Next chunk of {path}:\n{chunk}\n\n"
+                "Updated description:"
+            )
+            try:
+                response = self.llm.complete(
+                    system=system, history=[Turn(role="user", text=user_text)], tools=[],
+                    max_tokens=self.config.budget.max_output_tokens,
+                )
+                self.budget.record_usage(response.input_tokens, response.output_tokens)
+            except LLMError as e:
+                self.session.log_event("chunked_condensation_failed", {
+                    "path": path, "chunk": i, "of": len(chunks), "error": str(e),
+                })
+                break
+            running_description = (response.text or "").strip() or running_description
+            completed_chunks += 1
+        if not running_description:
+            return
+        if len(running_description) > _CONDENSED_FILE_ENTRY_CHAR_CAP:
+            running_description = running_description[:_CONDENSED_FILE_ENTRY_CHAR_CAP]
+        state.condensed_files[path] = running_description
+        self.session.log_event("chunked_condensation_completed", {
+            "path": path, "chunks_completed": completed_chunks, "chunks_total": len(chunks),
+        })
+        self.session.save_state(state)
+
+    def _condense_batch(self, state: "RunState", touched_files: set[str]) -> None:
         """
         Harness-triggered, not model-triggered: fires automatically once
         `condense_batch_size` distinct files have been read, regardless of
@@ -693,14 +836,37 @@ class Agent:
         calling into a class defined in file B -- even though this pass only
         writes A's entry), bounded by _render_condensed_files so a large
         repo's full dict can't itself overflow this call's own prompt.
+
+        Reads every touched file fresh off disk (see
+        _read_file_for_condensation) rather than depending on whatever a
+        model's own tool calls happened to capture -- always reflects
+        current content, and isn't limited by the model-facing read_file
+        tool's pagination cap.
         """
-        batch_content = _render_exploration_log(
-            [(label, content) for label, content in exploration_log
-             if any(path in label for path in touched_files)]
-        )
+        char_budget = self._condensation_char_budget()
+        contents: dict[str, str] = {}
+        for path in touched_files:
+            content = self._read_file_for_condensation(path)
+            if content is None:
+                state.condensed_files.pop(path, None)
+                continue
+            contents[path] = content
+
+        # Anything that can't fit EVEN ALONE in the whole budget gets
+        # condensed individually via chunking; the rest batch together
+        # normally, sharing the budget fairly (see
+        # _render_batch_content_for_condensation).
+        oversized = {p: c for p, c in contents.items() if len(c) > char_budget}
+        batchable = {p: c for p, c in contents.items() if len(c) <= char_budget}
+        for path, content in oversized.items():
+            self._condense_large_file_in_chunks(state, path, content, char_budget)
+
+        if not batchable:
+            return
+        batch_content = _render_batch_content_for_condensation(batchable, char_budget)
         if not batch_content:
             return
-        file_list = ", ".join(sorted(touched_files))
+        file_list = ", ".join(sorted(batchable))
         system = (
             "You are building per-file notes on a codebase being explored file by "
             "file. You will be given (a) existing notes on OTHER files already "
@@ -744,11 +910,11 @@ class Agent:
         # only apply entries whose path was actually in this batch. A
         # model ignoring the instruction and describing (or re-describing)
         # some other file cannot touch that file's real entry through this
-        # path -- the dict key space outside `touched_files` is simply
+        # path -- the dict key space outside `batchable` is simply
         # never written to, regardless of what comes back.
         applied = 0
         for path, note in parsed.items():
-            if path not in touched_files:
+            if path not in batchable:
                 continue
             if len(note) > _CONDENSED_FILE_ENTRY_CHAR_CAP:
                 note = note[:_CONDENSED_FILE_ENTRY_CHAR_CAP]
@@ -759,9 +925,9 @@ class Agent:
             # log it, but don't guess; existing entries (if any) for these
             # files are left exactly as they were rather than risking a
             # bad partial write.
-            self.session.log_event("condensation_parse_failed", {"files": sorted(touched_files)})
+            self.session.log_event("condensation_parse_failed", {"files": sorted(batchable)})
             return
-        self.session.log_event("condensation_pass", {"files": sorted(touched_files), "applied": applied})
+        self.session.log_event("condensation_pass", {"files": sorted(batchable), "applied": applied})
         self.session.save_state(state)
 
     def _call_llm(self, state: RunState, system: str, history: list[Turn], tools: list[dict]):
@@ -891,26 +1057,13 @@ class Agent:
         pays for one condensation pass, and never against edits later
         reverted by a failed acceptance check.
 
-        Reads each file fresh off disk rather than relying on the read/
-        exploration log -- an edited-but-never-re-read file has no log
-        entry to reuse, and a fresh read is also correct for a file that
-        WAS re-read earlier in the step but edited again afterward.
+        _condense_batch already reads every file fresh off disk internally
+        (see _read_file_for_condensation) and already drops a file's entry
+        if it no longer exists -- nothing further to do here beyond handing
+        it the set of dirty paths.
         """
-        synthetic_log: list[tuple[str, str]] = []
-        touched: set[str] = set()
-        for path in dirty_files:
-            try:
-                content = self.toolbox.dispatch("read_file", {"path": path})
-            except ToolError:
-                # Deleted (or moved) since being edited -- nothing to
-                # condense; drop any existing entry rather than let it
-                # describe a file that no longer exists.
-                state.condensed_files.pop(path, None)
-                continue
-            synthetic_log.append((f"read_file({path})", content))
-            touched.add(path)
-        if touched:
-            self._condense_batch(state, touched, synthetic_log)
+        if dirty_files:
+            self._condense_batch(state, dirty_files)
 
     # Real per-repo file-reading workload isn't knowable in advance, so
     # thresholds tuned for a 25-file run either nudge/condense too
@@ -1474,7 +1627,7 @@ class Agent:
                         if call.name in ("read_file", "code_skeleton") and target:
                             files_since_condense.add(target)
                             if len(files_since_condense) >= condense_batch_size:
-                                self._condense_batch(state, files_since_condense, exploration_log)
+                                self._condense_batch(state, files_since_condense)
                                 files_since_condense = set()
                 except ToolError as e:
                     print(f"    -> ERROR: {e}")
@@ -1977,7 +2130,7 @@ class Agent:
                         if call.name in ("read_file", "code_skeleton") and target:
                             inner_files_since_condense.add(target)
                             if len(inner_files_since_condense) >= condense_batch_size:
-                                self._condense_batch(state, inner_files_since_condense, inner_exploration_log)
+                                self._condense_batch(state, inner_files_since_condense)
                                 inner_files_since_condense = set()
 
                 if discard_call is not None:
