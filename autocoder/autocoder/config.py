@@ -106,19 +106,9 @@ class FinalReviewPolicy:
     to mean two things.
     """
     mode: str = "human"  # "human" | "llm_auto"
-    # "human": today's behavior, unchanged -- interactive [y/N] prompt.
+    # "human": normal usage -- interactive [y/N] prompt.
     # "llm_auto": a dedicated planner_llm review call decides instead, no human
-    #   prompt at all. Built at the person's explicit request, with the caution
-    #   already on record: across two real runs in testing, the interactive
-    #   human gate did NOT catch either of two real, confirmed bugs (a check
-    #   satisfied by corrupting the SVG width attribute rather than fixing the
-    #   check; a maze solver that mutated the maze to make its own "solved"
-    #   path look valid) -- both were accepted with a bare "y"/"ok" and only
-    #   found by separate, deliberate review afterward. This mode is not a
-    #   downgrade from a reliable safeguard; it's automating a checkpoint that,
-    #   as actually used, wasn't catching this class of bug either way. It is a
-    #   genuinely different question being asked, not a rubber stamp -- see
-    #   the system prompt in Agent._llm_final_review.
+    #   prompt at all. 
 
 
 @dataclass
