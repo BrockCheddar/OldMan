@@ -97,6 +97,31 @@ class ApprovalPolicy:
 
 
 @dataclass
+class FinalReviewPolicy:
+    """Governs who decides whether a declare_done with no final_acceptance_command
+    gets accepted, when there's no automated command to check it. Separate from
+    ApprovalPolicy on purpose -- that governs whether a SHELL COMMAND is safe to
+    run; this governs whether declared WORK is correct. Different axis, different
+    failure mode, so a different config surface rather than overloading "approval"
+    to mean two things.
+    """
+    mode: str = "human"  # "human" | "llm_auto"
+    # "human": today's behavior, unchanged -- interactive [y/N] prompt.
+    # "llm_auto": a dedicated planner_llm review call decides instead, no human
+    #   prompt at all. Built at the person's explicit request, with the caution
+    #   already on record: across two real runs in testing, the interactive
+    #   human gate did NOT catch either of two real, confirmed bugs (a check
+    #   satisfied by corrupting the SVG width attribute rather than fixing the
+    #   check; a maze solver that mutated the maze to make its own "solved"
+    #   path look valid) -- both were accepted with a bare "y"/"ok" and only
+    #   found by separate, deliberate review afterward. This mode is not a
+    #   downgrade from a reliable safeguard; it's automating a checkpoint that,
+    #   as actually used, wasn't catching this class of bug either way. It is a
+    #   genuinely different question being asked, not a rubber stamp -- see
+    #   the system prompt in Agent._llm_final_review.
+
+
+@dataclass
 class Config:
     workspace_root: Path
     source_repo: Path | None = None
@@ -104,6 +129,7 @@ class Config:
     planner_llm: LLMBackendConfig | None = None   # None => reuse `llm` for planning too (normal for one local model)
     budget: Budget = field(default_factory=Budget)
     approval: ApprovalPolicy = field(default_factory=ApprovalPolicy)
+    final_review: FinalReviewPolicy = field(default_factory=FinalReviewPolicy)
 
     def effective_planner_llm(self) -> LLMBackendConfig:
         return self.planner_llm if self.planner_llm is not None else self.llm
@@ -149,6 +175,7 @@ def load_config(workspace_root: Path, source_repo: Path | None, config_path: Pat
 
     budget = Budget(**{**asdict(Budget()), **data.get("budget", {})})
     approval = ApprovalPolicy(**{**asdict(ApprovalPolicy()), **data.get("approval", {})})
+    final_review = FinalReviewPolicy(**{**asdict(FinalReviewPolicy()), **data.get("final_review", {})})
 
     return Config(
         workspace_root=workspace_root,
@@ -157,4 +184,5 @@ def load_config(workspace_root: Path, source_repo: Path | None, config_path: Pat
         planner_llm=planner_llm,
         budget=budget,
         approval=approval,
+        final_review=final_review,
     )

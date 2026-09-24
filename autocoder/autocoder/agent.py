@@ -2391,7 +2391,12 @@ class Agent:
         if final_acceptance_command:
             return self._run_final_acceptance_command(final_acceptance_command)
 
-        # No final acceptance command -- ask the human.
+        # No final acceptance command -- either a human decides, or (if
+        # configured) a dedicated LLM review does. See FinalReviewPolicy
+        # in config.py for the reasoning and the tradeoff being made here.
+        if self.config.final_review.mode == "llm_auto":
+            return self._llm_final_review(state, summary)
+
         print(f"\n[done] model declares goal complete:\n  {summary}")
         self.budget.pause()
         try:
@@ -2417,6 +2422,83 @@ class Agent:
         if not reason:
             reason = "Human rejected without giving a specific reason. Re-examine your work critically."
         return False, reason
+
+    def _llm_final_review(self, state: RunState, summary: str) -> tuple[bool, str]:
+        """
+        FinalReviewPolicy.mode == "llm_auto": a dedicated planner_llm call
+        replaces the interactive human [y/N] prompt. Printed and logged,
+        not silent -- the whole point of "a reason why" is that it stays
+        auditable even with no human watching in real time.
+
+        Deliberately NOT the same question declare_done's own summary
+        already answered ("does this look done") -- re-asking that would
+        just echo the same self-assessment, buying nothing. This asks a
+        narrower, different question: do the acceptance checks that
+        already passed actually establish the claimed properties, or
+        could they pass against a deliberately broken implementation?
+        Same mutation-testing framing that would have caught both real
+        bugs found in testing this harness (a check satisfied by
+        corrupting output rather than fixing the check; a solver whose
+        own test validated a side effect of the bug rather than
+        independent ground truth).
+
+        Best-effort like self-audit and chunked condensation: an LLMError
+        here can't fall back to asking a human either -- no one's there
+        to ask, that's the scenario this mode exists for -- so it fails
+        toward NOT accepting rather than silently accepting on a broken
+        review call.
+        """
+        print(f"\n[done] model declares goal complete:\n  {summary}")
+        prompt = (
+            f"GOAL:\n{state.goal}\n\n"
+            f"MODEL'S CLAIM:\n{summary}\n\n"
+            "COMPLETED STEPS (each already passed its own acceptance command "
+            "when marked done, and the full regression check just passed "
+            f"again against ALL of them right now):\n{state.completed_summary_text()}\n\n"
+            "Before accepting, look specifically for whether the acceptance "
+            "evidence above actually establishes the claimed properties, or "
+            "could pass against a subtly broken implementation. In particular:\n"
+            "- Would any of these checks still pass if the code under test "
+            "were replaced with something plausible-looking but wrong?\n"
+            "- Does any check validate a SIDE EFFECT of the code being "
+            "tested (e.g. checking state the code itself just mutated to "
+            "make the check pass) rather than an independent ground truth?\n"
+            "- Does any check use a loose match (e.g. a literal substring) "
+            "that could be satisfied by corrupting output rather than "
+            "making it correct?\n\n"
+            "Respond with EXACTLY two lines, nothing else:\n"
+            "ACCEPT: yes or no\n"
+            "REASON: <your reasoning, specific to the evidence above>"
+        )
+        try:
+            response = self.planner_llm.complete(
+                system=(
+                    "You are the final review pass for an autonomous coding "
+                    "run, replacing a human's accept/reject decision because "
+                    "no human is available. You do not write code. Your only "
+                    "job is to judge whether the evidence already gathered "
+                    "actually supports the claim that the goal is done -- "
+                    "skeptically, the way a careful reviewer checks a test "
+                    "suite isn't fooling itself, not by re-deciding whether "
+                    "the goal merely sounds achieved."
+                ),
+                history=[Turn(role="user", text=prompt)],
+                tools=[], max_tokens=self.config.budget.max_output_tokens,
+            )
+        except LLMError as e:
+            self.session.log_event("llm_final_review_error", {"error": str(e)})
+            print(f"[final-review] LLM review call failed ({e}) -- treating as not accepted")
+            return False, (
+                f"Automated final review could not run ({e}). Re-examine "
+                "your work critically before declaring done again."
+            )
+
+        accept, reason = _parse_final_review_response(response.text or "")
+        print(f"[final-review] {'ACCEPTED' if accept else 'REJECTED'}: {reason}")
+        self.session.log_event("llm_final_review", {"accept": accept, "reason": reason})
+        if accept:
+            return True, ""
+        return False, reason or "Automated review did not accept this as done, with no reason given."
 
     def _run_final_acceptance_command(self, final_acceptance_command: str) -> tuple[bool, str]:
         """Runs the goal-level acceptance command and returns (accepted,
@@ -2814,6 +2896,33 @@ def _parse_replan_response(text: str) -> tuple[str, str]:
         elif current is not None:
             current.append(line)
     return "\n".join(objective_lines).strip(), "\n".join(command_lines).strip()
+
+
+def _parse_final_review_response(text: str) -> tuple[bool, str]:
+    """Same tolerant two-line format as _parse_self_audit_response's
+    ON_TRACK line, but a different safe-failure direction on purpose:
+    self-audit defaults to on_track=True on a garbled response (a missed
+    optimization is low stakes), but this defaults to accept=False --
+    a garbled response here must never accidentally read as acceptance.
+    The safe failure is asking the model to keep working, not silently
+    treating an unparseable review as a pass."""
+    accept = False
+    reason_lines: list[str] = []
+    current: list[str] | None = None
+    for line in text.splitlines():
+        upper = line.upper()
+        if upper.startswith("ACCEPT:"):
+            accept = line.split(":", 1)[1].strip().lower() in ("yes", "true")
+            current = None
+        elif upper.startswith("REASON:"):
+            current = reason_lines
+            current.append(line.split(":", 1)[1].strip())
+        elif current is not None:
+            current.append(line)
+    reason = "\n".join(reason_lines).strip()
+    if not reason:
+        reason = text.strip()[:500] or "(no reason given)"
+    return accept, reason
 
 
 def _parse_self_audit_response(text: str) -> tuple[bool, str, str, list[str]]:
